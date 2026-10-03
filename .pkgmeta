@@ -1,0 +1,8 @@
+package-as: ShotWindow
+
+ignore:
+  - tests
+
+manual-changelog:
+  filename: RELEASE-NOTES.md
+  markup-type: markdown

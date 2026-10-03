@@ -1,0 +1,11 @@
+## Interface: 16001
+## Title: Shot Window
+## Notes: Marks the game's ranged swing timer for hunters: when to stand still so Auto Shot is not delayed.
+## Author: jonlipin
+## Version: 0.1.0
+## SavedVariablesPerCharacter: ShotWindowDB
+## IconTexture: Interface\Icons\Ability_Whirlwind
+## X-Category: Combat
+## X-License: MIT
+
+ShotWindow.lua
