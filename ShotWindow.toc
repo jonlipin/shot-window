@@ -1,6 +1,6 @@
 ## Interface: 16001
 ## Title: Shot Window
-## Notes: Marks the game's ranged swing timer for hunters: when to stand still so Auto Shot is not delayed.
+## Notes: Marks the game's ranged swing timer for Auto Shot and wands: when to stand still so the shot is not delayed, held until a late shot fires.
 ## Author: jonlipin
 ## Version: 0.1.0
 ## SavedVariablesPerCharacter: ShotWindowDB
