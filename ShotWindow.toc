@@ -6,6 +6,7 @@
 ## SavedVariablesPerCharacter: ShotWindowDB
 ## IconTexture: Interface\Icons\Ability_Whirlwind
 ## X-Category: Combat
+## X-Website: https://github.com/jonlipin/shot-window
 ## X-License: MIT
 
 ShotWindow.lua
