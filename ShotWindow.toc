@@ -2,7 +2,8 @@
 ## Title: Shot Window
 ## Notes: Marks the game's ranged swing timer for Auto Shot and wands: when to stand still so the shot is not delayed, held until a late shot fires.
 ## Author: jonlipin
-## Version: 0.1.0
+## Version: 0.2.0
+## OptionalDeps: EllesmereUI
 ## SavedVariablesPerCharacter: ShotWindowDB
 ## IconTexture: Interface\Icons\Ability_Whirlwind
 ## X-Category: Combat
@@ -10,3 +11,5 @@
 ## X-License: MIT
 
 ShotWindow.lua
+Styles.lua
+ShotWindow_Skins.lua

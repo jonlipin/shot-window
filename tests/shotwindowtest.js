@@ -14,6 +14,11 @@
 //   node tests/shotwindowtest.js [--verbose]
 //   SHOTWINDOW_LUA=<path> node tests/shotwindowtest.js   (check another copy of the file)
 //
+// Window styles: Styles.lua and ShotWindow_Skins.lua load after ShotWindow.lua with the same
+// namespace, as the TOC lists them. A scenario can run Lua before the files load (its third
+// argument), which is how the EllesmereUI scenarios put a recording stand-in facade in place.
+// Styles.lua draws with Interface\Buttons\WHITE8X8; that use is listed as a note, not a failure.
+//
 // fengari is looked for in FENGARI=<its folder>, then on the normal require path, then in the
 // scratchpad copy it was first run from.
 //
@@ -40,6 +45,8 @@ const ADDON_FILE = 'ShotWindow.lua';
 const ADDON_SOURCE = '@' + ADDON_FILE;
 // SHOTWINDOW_LUA=<file> runs the same checks against another copy (a candidate fix, say).
 const ADDON_SRC = fs.readFileSync(process.env.SHOTWINDOW_LUA || path.join(ROOT, ADDON_FILE), 'utf8');
+const STYLES_SRC = fs.readFileSync(path.join(ROOT, 'Styles.lua'), 'utf8');
+const SKINS_SRC = fs.readFileSync(path.join(ROOT, 'ShotWindow_Skins.lua'), 'utf8');
 
 function findFengari() {
   const tries = [];
@@ -302,6 +309,7 @@ function Texture:SetAlpha(a)
   log[#log + 1] = a
 end
 function Texture:IsShown() return self.shown end
+function Texture:SetHeight(h) self.height = h end
 
 local Frame = {}
 local FrameMeta = strict(Frame, "Frame")
@@ -356,12 +364,32 @@ function T.update(elapsed)
   end
 end
 function T.slash(msg) T.call(SlashCmdList.SHOTWINDOW, msg) end
--- Blizzard_SwingTimer's frame; its StatusBar is what the addon draws on.
-function T.makeBar(width)
-  local frame = strictFrame("Frame", "SwingTimerRangedFrame", UIParent)
+-- Blizzard_SwingTimer's frames, after Blizzard_SwingTimer.xml: Background and Border on the frame,
+-- the StatusBar with its Pip and labels. Their art is kept off bar.textures, which holds only what
+-- the addon makes. Its StatusBar is what the addon draws on.
+local function blizzardTexture(atlas)
+  return setmetatable({ parent = false, layer = "BACKGROUND", sublevel = 0, shown = true, points = {}, width = 0,
+    color = false, colorCalls = 0, atlas = atlas }, TextureMeta)
+end
+local Label = {}
+local LabelMeta = strict(Label, "FontString")
+function Label:GetFont() return "Fonts\\FRIZQT__.TTF", 10, "" end
+function Label:SetFont(path) self.fontFile = path end
+function Label:SetTextColor(r, g, b) self.textColor = { r, g, b } end
+function T.makeSwing(name, width)
+  local frame = strictFrame("Frame", name, UIParent)
+  frame.Background = blizzardTexture("ui-swingtimerbar-background")
+  frame.Border = blizzardTexture("ui-swingtimerbar-frame")
   local bar = strictFrame("StatusBar", nil, frame)
   bar.width, bar.height = width or 200, 12
+  bar.Pip = blizzardTexture("ui-swingtimerbar-pip")
+  bar.TypeLabel = setmetatable({ text = "Ranged" }, LabelMeta)
+  bar.TimeLabel = setmetatable({ text = "0.0" }, LabelMeta)
   frame.StatusBar = bar
+  return frame, bar
+end
+function T.makeBar(width)
+  local _, bar = T.makeSwing("SwingTimerRangedFrame", width)
   T.bar = bar
   return bar
 end
@@ -396,7 +424,7 @@ function T.span(t)
   end
   return t.points[1][4], t.width
 end
--- A line's centre x, or nil when hidden.
+-- A line's center x, or nil when hidden.
 function T.line(t)
   if not t.shown then return nil end
   if #t.points ~= 2 or t.points[1][4] ~= t.points[2][4] or t.points[1][1] ~= "TOP" or t.points[2][1] ~= "BOTTOM" or t.width ~= (T.lineW or T.pixelSize or 2) then
@@ -427,7 +455,7 @@ function checkAllHidden(label)
   for k, t in pairs(T.tex()) do check(not t.shown, label .. ": " .. k .. " hidden") end
 end
 function alpha() local c = T.tex().stand.color return c and c[4] end
--- The red zone's own alpha (SetAlpha: the pulse), apart from the alpha of its colour.
+-- The red zone's own alpha (SetAlpha: the pulse), apart from the alpha of its color.
 function T.standAlpha() return rawget(T.tex().stand, "alpha") end
 function T.alphaLog() return rawget(T.tex().stand, "alphaLog") or {} end
 function T.alphaCount() return #T.alphaLog() end
@@ -581,7 +609,10 @@ function TX:SetVertexColor(r, g, b, a) self.vertex = { r, g, b, a or 1 } end
 function TX:GetVertexColor() local v = rawget(self, "vertex") or { 1, 1, 1, 1 } return v[1], v[2], v[3], v[4] end
 function TX:SetTexture(file)
   self.file = file
-  if realType(file) == "string" and file:lower():find("interface\\buttons", 1, true) then T.buttonArt[#T.buttonArt + 1] = file end
+  if realType(file) == "string" and file:lower():find("interface\\buttons", 1, true) then
+    if file:lower():find("white8x8", 1, true) then T.flatArt = (T.flatArt or 0) + 1
+    else T.buttonArt[#T.buttonArt + 1] = file end
+  end
 end
 function TX:SetAtlas(atlas) self.atlas = atlas end
 function TX:SetDrawLayer(layer, sub) self.layer, self.sublevel = layer, sub end
@@ -723,6 +754,46 @@ end
 function CS:GetColorRGB() return self.rgb[1], self.rgb[2], self.rgb[3] end
 function CS:SetColorAlpha(a) if realType(a) ~= "number" then error("ColorSelect:SetColorAlpha(): number expected", 2) end self.colorAlpha = a end
 function CS:GetColorAlpha() return self.colorAlpha end
+
+-- What the window styles' drawing calls use (Styles.lua and the EllesmereUI facade).
+do
+  local frameKinds = { "Frame", "Button", "CheckButton", "Slider", "ColorSelect" }
+  for _, kind in ipairs(frameKinds) do
+    local t = M[kind]
+    t.IsObjectType = function(self, what) return what == self.kind or what == "Frame" or (what == "Button" and self.kind == "CheckButton") end
+    t.GetRegions = function(self)
+      local list = {}
+      for _, r in ipairs(self.textures) do list[#list + 1] = r end
+      for _, r in ipairs(self.fontStrings) do list[#list + 1] = r end
+      return table.unpack(list)
+    end
+    t.GetChildren = function(self) return table.unpack(self.children) end
+  end
+  for _, kind in ipairs({ "Button", "CheckButton" }) do
+    M[kind].SetHighlightFontObject = function(self, f) self.highlightFont = f end
+    M[kind].SetDisabledFontObject = function(self, f) self.disabledFont = f end
+  end
+  M.Texture.IsObjectType = function(_, what) return what == "Texture" end
+  M.Texture.SetGradient = function(self, orient, a, b) self.gradient = { orient, a, b } end
+  M.Texture.SetRotation = function(self, r) self.rotation = r end
+  M.Texture.SetTexCoord = function(self, ...) self.texCoord = { ... } end
+  M.Texture.GetNumMaskTextures = function() return 0 end
+  M.FontString.IsObjectType = function(_, what) return what == "FontString" end
+  M.FontString.GetFont = function(self) return "Fonts\\FRIZQT__.TTF", 12, "" end
+  M.FontString.SetFont = function(self, path, size, flags) self.fontFile = path return true end
+end
+function CreateColor(r, g, b, a) return { r = r, g = g, b = b, a = a } end
+GameTooltip = { lines = {} }
+function GameTooltip:SetOwner(owner) self.owner, self.lines = owner, {} end
+function GameTooltip:SetText(text) self.lines = { text } end
+function GameTooltip:AddLine(text) self.lines[#self.lines + 1] = text end
+function GameTooltip:Show() self.shown = true end
+function GameTooltip:Hide() self.shown = false end
+function T.tooltipHas(text)
+  for _, l in ipairs(GameTooltip.lines) do if realType(l) == "string" and l:find(text, 1, true) then return true end end
+  return false
+end
+C_UI = { Reload = function() T.reloads = (T.reloads or 0) + 1 end }
 
 local function newUI(kind, name, parent)
   local f = setmetatable({ kind = kind, name = name or false, ui = true, children = {}, shown = true,
@@ -878,9 +949,18 @@ end
 
 -- HideUIPanel(SettingsPanel) and SettingsPanel:Hide() from addon code are refused on Forever: the
 -- call does nothing (the client shows its "blocked" message), T.blocked counts them.
-function ShowUIPanel(f) if f then f:Show() end end
+-- In combat both refuse (CheckProtectedFunctionsAllowed: InCombatLockdown() and not issecure()).
+-- HideUIPanel refuses whoever calls it: a close X on an addon's own window runs it from tainted
+-- code even though only Blizzard's UIPanelCloseButton_OnClick is on the stack. ShowUIPanel spares
+-- the player's own secure path (opening the panel by hand), so only addon calls are refused.
+T.combatRefusals = 0
+function ShowUIPanel(f)
+  if InCombatLockdown() and fromaddon() then T.combatRefusals = T.combatRefusals + 1 T.blocked = T.blocked + 1 return end
+  if f then f:Show() end
+end
 function HideUIPanel(f)
   T.hideCalls = T.hideCalls + 1
+  if InCombatLockdown() then T.combatRefusals = T.combatRefusals + 1 T.blocked = T.blocked + 1 return end
   if f == SettingsPanel and fromaddon() and not T.hidePanelWorks then T.blocked = T.blocked + 1 return end
   if f then rawHide(f) end
 end
@@ -1028,8 +1108,8 @@ end
 local function canTouch(f, what)
   if not f then T.fails[#T.fails + 1] = what .. ": no such control" return false end
   if not f:IsVisible() then T.fails[#T.fails + 1] = what .. ": the control is not visible" return false end
-  -- T.strictMouse: a control with the mouse turned off (greyed out) cannot be clicked or dragged.
-  if T.strictMouse and rawget(f, "mouse") == false then T.fails[#T.fails + 1] = what .. ": the control does not take the mouse (greyed out)" return false end
+  -- T.strictMouse: a control with the mouse turned off (grayed out) cannot be clicked or dragged.
+  if T.strictMouse and rawget(f, "mouse") == false then T.fails[#T.fails + 1] = what .. ": the control does not take the mouse (grayed out)" return false end
   if (f.width or 0) <= 0 or (f.height or 0) <= 0 then
     T.fails[#T.fails + 1] = what .. ": the control has no size (" .. tostring(f.width) .. "x" .. tostring(f.height) .. "), so it cannot be clicked"
     return false
@@ -1051,7 +1131,7 @@ function T.drag(s, v)
   sliderSet(s, v, true)
 end
 function T.pickColor(r, g, b)
-  if not T.picker:IsShown() then T.fails[#T.fails + 1] = "T.pickColor: the colour picker is not shown" return end
+  if not T.picker:IsShown() then T.fails[#T.fails + 1] = "T.pickColor: the color picker is not shown" return end
   T.mouseDown(T.picker.Content.ColorPicker)
   T.picker.Content.ColorPicker:SetColorRGB(r, g, b)
 end
@@ -1130,21 +1210,21 @@ function rgbText(t)
   return realFormat("%.3f,%.3f,%.3f", t[1] or -1, t[2] or -1, t[3] or -1)
 end
 function T.swatchRGB(label) local s = T.swatch(label) return s and s.Color and s.Color.vertex end
--- Greyed out (SetUsable): alpha 0.45 and the mouse off; usable: alpha 1 and the mouse not off.
--- A slider greys its holder (caption and value) and turns off the slider's mouse.
-function T.greyState(f, holder)
+-- Grayed out (SetUsable): alpha 0.45 and the mouse off; usable: alpha 1 and the mouse not off.
+-- A slider grays its holder (caption and value) and turns off the slider's mouse.
+function T.grayState(f, holder)
   local a = rawget(holder or f, "alpha") or 1
   local m = rawget(f, "mouse")
   if a == 1 and m ~= false then return "usable" end
-  if near(a, 0.45) and m == false then return "greyed" end
+  if near(a, 0.45) and m == false then return "grayed" end
   return "mixed (alpha " .. tostring(a) .. ", mouse " .. tostring(m) .. ")"
 end
 function T.controlState(label)
   local s = T.slider(label)
-  if s then return T.greyState(s, s.parent) end
+  if s then return T.grayState(s, s.parent) end
   local c = T.checkbox(label) or T.swatch(label)
   if not c then return "missing" end
-  return T.greyState(c)
+  return T.grayState(c)
 end
 function checkControls(label, want)
   local names = {}
@@ -1178,7 +1258,15 @@ function loadAddon(S) {
   lua.lua_newtable(S);
   lua.lua_pushvalue(S, -1); lua.lua_setglobal(S, to_luastring('NS'));
   if (lua.lua_pcall(S, 2, 0, 0) !== 0) return lua.lua_tojsstring(S, -1);
-  return exec(S, 'T.driver = T.frames[#T.frames]', '=test');
+  const drv = exec(S, 'T.driver = T.frames[#T.frames]', '=test');
+  if (drv) return drv;
+  for (const [src, name] of [[STYLES_SRC, '@Styles.lua'], [SKINS_SRC, '@ShotWindow_Skins.lua']]) {
+    if (lauxlib.luaL_loadbuffer(S, to_luastring(src), null, to_luastring(name)) !== 0) return lua.lua_tojsstring(S, -1);
+    lua.lua_pushstring(S, to_luastring('ShotWindow'));
+    lua.lua_getglobal(S, to_luastring('NS'));
+    if (lua.lua_pcall(S, 2, 0, 0) !== 0) return name + ': ' + lua.lua_tojsstring(S, -1);
+  }
+  return null;
 }
 
 // The trap must work before anything it says can be trusted.
@@ -1207,9 +1295,11 @@ function selfTest() {
 }
 
 let failed = 0, passed = 0, checks = 0;
-function scenario(name, body) {
+function scenario(name, body, pre) {
   HITS = new Map(); SEEN = new Map();
   const S = newState();
+  const preErr = pre ? exec(S, pre, '=pre') : null;
+  if (preErr) throw new Error(name + ': pre: ' + preErr);
   const loadErr = loadAddon(S);
   let lines = [];
   if (loadErr) lines.push('E\tloading ShotWindow.lua: ' + loadErr);
@@ -1253,7 +1343,7 @@ scenario('hunter login: textures, hook, events, preview from the weapon speed', 
   check(#T.bar.textures >= 3 and T.fillTint() ~= nil and T.fillTint().allPoints == T.bar:GetStatusBarTexture() and not T.fillTint().shown, "stand, line and a hidden fill tint laid over the fill (got " .. #T.bar.textures .. ")")
   local x = T.tex()
   check(x.stand.layer == "ARTWORK" and x.stand.sublevel == 6 and x.line.layer == "ARTWORK" and x.line.sublevel == 7, "draw layers")
-  check(x.stand.color[1] == 0.95 and x.stand.color[4] == 0.35 and x.line.color[4] == 0.95, "colours")
+  check(x.stand.color[1] == 0.95 and x.stand.color[4] == 0.35 and x.line.color[4] == 0.95, "colors")
   check(#(T.bar.hooks.OnSizeChanged or {}) == 1, "OnSizeChanged hooked once")
   local ev = T.driver.events
   check(ev.PLAYER_SWING == true and ev.WEAPON_SLOT_CHANGED == true and ev.PLAYER_EQUIPMENT_CHANGED == true
@@ -1290,7 +1380,7 @@ scenario('ranged swing 2.8 s: band position, red zone brightening, swing end', S
   T.now = 200 T.fire("PLAYER_SWING", 2.8, 2)
   calls = x.stand.colorCalls
   for k = 1, 290 do T.now = 200 + k * 0.01 T.update(0.01) end
-  check(x.stand.colorCalls == calls + 2, "two colour changes over a full swing (" .. (x.stand.colorCalls - calls) .. ")")
+  check(x.stand.colorCalls == calls + 2, "two color changes over a full swing (" .. (x.stand.colorCalls - calls) .. ")")
   check(#T.errors == 0, "no errors")
 `);
 
@@ -1402,15 +1492,15 @@ scenario('/shotwindow debug, garbage and empty input', String.raw`
   T.login(200)
   T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
   T.slash("debug")
-  check(T.said("version 0.1.0"), "debug: version")
+  check(T.said("version 0.2.0"), "debug: version")
   check(T.said("bar found: true, showSwingTimer: 1"), "debug: bar and cvar")
   check(T.said("swing: 2.8 s (weapon 2.8 s)"), "debug: swing line")
   check(T.said("red zone: last 0.50 s = window 0.50 s + latency 0 ms + extra 0 ms"), "debug: red zone line")
   local n = #T.prints
   T.slash("garbage words")
-  check(#T.prints == n + 5 and T.said("/shotwindow window <seconds>") and T.said("/shotwindow debug"), "garbage shows usage")
+  check(#T.prints == n + 6 and T.said("/shotwindow window <seconds>") and T.said("/shotwindow debug"), "garbage shows usage")
   T.slash("help")
-  check(#T.prints == n + 10, "help shows usage (" .. (#T.prints - n) .. ")")
+  check(#T.prints == n + 12, "help shows usage (" .. (#T.prints - n) .. ")")
   checkBands("unchanged by debug/usage", 200, 2.8, 0.5, 0)
   check(#T.errors == 0, "no errors")
 `);
@@ -1521,11 +1611,11 @@ scenario('the bar appears after login (ADDON_LOADED path)', String.raw`
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('non-hunter login does nothing and raises nothing', String.raw`
+scenario('non-hunter login: no zone and nothing on the bar, only the look', String.raw`
   T.className, T.class = "Warrior", "WARRIOR"
   T.login(200)
-  check(SlashCmdList.SHOTWINDOW == nil, "no slash command")
-  check(ShotWindowDB == nil, "no saved variables")
+  check(SlashCmdList.SHOTWINDOW ~= nil, "slash command, for the look")
+  check(type(ShotWindowDB) == "table" and ShotWindowDB.style == "auto", "saved variables, for the look")
   check(#T.bar.textures == 0, "nothing drawn on the bar")
   for e in pairs(T.driver.events) do check(e == "PLAYER_LOGIN", "only PLAYER_LOGIN registered (also " .. e .. ")") end
   T.fire("PLAYER_SWING", 2.0, 0) T.fire("PLAYER_SWING", 2.8, 2) T.fire("UNIT_ATTACK_SPEED", "player") T.fire("WEAPON_SLOT_CHANGED")
@@ -1599,10 +1689,33 @@ scenario('options: page registered at hunter login, hidden, no proxy settings', 
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: no page for a class without Auto Shot or a wand', String.raw`
+scenario('options: a class without Auto Shot or a wand gets a page with the look only, and is told why', String.raw`
   T.className, T.class = "Rogue", "ROGUE"
   T.login(200)
-  check(#T.settings.canvas == 0 and #T.settings.addon == 0, "no category registered")
+  check(#T.settings.canvas == 1 and #T.settings.addon == 1, "a category registered")
+  T.slash("")
+  local page = T.page()
+  local c
+  for _, f in ipairs(T.frames) do if rawget(f, "parent") == page and rawget(f, "swParts") then c = f end end
+  check(c ~= nil and c:IsVisible(), "the page shows its controls")
+  local has = {}
+  for _, fs in ipairs(c and c.fontStrings or {}) do if rawget(fs, "text") then has[#has + 1] = fs.text end end
+  local all = table.concat(has, "|")
+  check(all:find("Look", 1, true) and all:find("no stand-still zone", 1, true) and not all:find("Timing", 1, true)
+    and not all:find("Red zone", 1, true) and not all:find("Color picker", 1, true), "the look, a line saying why, no zone settings (" .. all .. ")")
+  local style, opacity, defaults
+  for _, f in ipairs(T.frames) do
+    if rawget(f, "parent") == c and f.kind == "Button" and rawget(f, "text") == "Window style: Automatic" then style = f end
+    if rawget(f, "parent") == c and f.kind == "Button" and rawget(f, "text") == "Defaults" then defaults = f end
+  end
+  check(style ~= nil and defaults ~= nil, "the style button and Defaults")
+  T.click(style, "RightButton")
+  check(ShotWindowDB.style == "dark" and NS.report.skin == "Dark", "the style can be chosen here (" .. tostring(NS.report.skin) .. ")")
+  T.slash("window 0.3")
+  check(ShotWindowDB.window == 0.5 and T.said("the stand-still zone is for hunters and wand users"), "zone commands answer with what applies")
+  T.slash("debug")
+  check(T.said("no stand-still zone on this character"), "debug says so")
+  check(#T.bar.textures > 0 and T.tex().stand.sublevel ~= 6, "the bar went flat, with no zone on it")
   check(#T.errors == 0, "no errors")
 `);
 
@@ -1627,7 +1740,7 @@ scenario('options: /shotwindow opens the page by category ID and builds the cont
     check(T.checkbox(l) and T.checkbox(l):GetChecked() == true, "checked: " .. l)
   end
   check(T.checkbox("Tint the fill inside the zone"):GetChecked() == false, "fill tint unchecked")
-  for _, l in ipairs({ "Zone colour", "Line colour", "Fill colour" }) do
+  for _, l in ipairs({ "Zone color", "Line color", "Fill color" }) do
     check(rgbIs(T.swatchRGB(l), 0.95, 0.20, 0.15), "swatch painted: " .. l .. " (" .. rgbText(T.swatchRGB(l)) .. ")")
   end
   check(T.status() and T.status():find("last 0.50 s", 1, true) ~= nil, "status line (" .. tostring(T.status()) .. ")")
@@ -1672,7 +1785,7 @@ scenario('options: the page does not open -> standalone window, /shotwindow togg
   T.slash("")
   local w = T.window()
   check(w ~= nil and w:IsShown() and w:IsVisible(), "window shown")
-  check(w and w:GetFrameStrata() == "HIGH", "HIGH strata, under the DIALOG colour picker")
+  check(w and w:GetFrameStrata() == "HIGH", "HIGH strata, under the DIALOG color picker")
   local listed = false
   for _, n in ipairs(UISpecialFrames) do if n == "ShotWindowOptions" then listed = true end end
   check(listed, "in UISpecialFrames, so Esc closes it")
@@ -1706,6 +1819,41 @@ scenario('options: the page does not open -> standalone window, /shotwindow togg
   check(#T.errors == 0, "no errors")
 `);
 
+// The window's X in combat: the game's UIPanelCloseButton_OnClick goes through HideUIPanel, which
+// refuses in combat, so the X must hide the window itself. Every way the window can be built.
+for (const [label, setup, closeOf] of [
+  ['ButtonFrameTemplate', '', 'w.CloseButton'],
+  ['BasicFrameTemplateWithInset', 'T.templates.ButtonFrameTemplate = nil', 'w.CloseButton'],
+  ['no frame template, own UIPanelCloseButton', 'T.templates.ButtonFrameTemplate, T.templates.BasicFrameTemplateWithInset = nil, nil', 'w.swClose'],
+  ['Dark style', 'ShotWindowDB = { style = "dark" }', 'w.CloseButton'],
+]) {
+  scenario('options: the window close X works in combat (' + label + ')', String.raw`
+    T.openFails = true
+    ` + setup + String.raw`
+    T.login(200)
+    T.fire("PLAYER_ENTERING_WORLD")
+    T.slash("")
+    local w = T.window()
+    local close = w and ` + closeOf + String.raw`
+    check(w and w:IsShown() and close ~= nil, "window shown with its X")
+    T.click(close)
+    check(not w:IsShown(), "out of combat: the X closes it")
+    T.slash("")
+    check(w:IsShown(), "shown again")
+    T.combat = true
+    local before = T.combatRefusals
+    T.click(close)
+    check(not w:IsShown() and not w:IsVisible(), "in combat: the X closes it")
+    check(T.combatRefusals == before, "no HideUIPanel refused in combat (" .. (T.combatRefusals - before) .. ")")
+    check(T.blocked == 0, "nothing blocked")
+    T.slash("")
+    check(w:IsShown(), "in combat: /shotwindow opens it again")
+    T.click(close)
+    check(not w:IsShown() and T.combatRefusals == before, "and the X closes it again")
+    check(#T.errors == 0, "no errors")
+  `);
+}
+
 scenario('options: no Settings API -> window straight away', String.raw`
   Settings = nil
   T.login(200)
@@ -1727,7 +1875,7 @@ scenario('options: switching category and back; a small canvas scales the contro
   T.closePanel()
   T.canvas:SetSize(500, 400)
   T.slash("")
-  local want = math.min(1, 488 / 600, 350 / 440)
+  local want = math.min(1, 488 / 600, 350 / 532)
   check(near(c:GetScale(), want), "scaled to fit (" .. tostring(c:GetScale()) .. ", want " .. want .. ")")
   T.update(0.016)
   check(near(c:GetScale(), want) and c:IsVisible(), "refit on OnSizeChanged")
@@ -1817,7 +1965,7 @@ scenario('options: checkboxes toggle their keys and the visuals', String.raw`
   local fill = T.fillTint()
   T.click(tint)
   check(ShotWindowDB.fillTint == true and fill.shown, "fill tint on inside the zone: shown at once")
-  check(rgbIs(fill.color, 0.95, 0.20, 0.15) and near(fill.color[4], 0.75), "fill tint colour and opacity")
+  check(rgbIs(fill.color, 0.95, 0.20, 0.15) and near(fill.color[4], 0.75), "fill tint color and opacity")
   T.now = 102.9 T.update() check(not fill.shown, "hidden at swing end")
   T.now = 200 T.fire("PLAYER_SWING", 2.8, 2) check(not fill.shown, "hidden at swing start")
   T.now = 202.0 T.update() check(not fill.shown, "hidden before the zone")
@@ -1827,32 +1975,32 @@ scenario('options: checkboxes toggle their keys and the visuals', String.raw`
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: colour swatches (live, Okay, Cancel, click outside, Escape)', String.raw`
+scenario('options: color swatches (live, Okay, Cancel, click outside, Escape)', String.raw`
   T.login(200)
   T.slash("")
-  local sw, x = T.swatch("Zone colour"), T.tex()
+  local sw, x = T.swatch("Zone color"), T.tex()
   local calls, paints = x.stand.colorCalls, sw.Color.vertex
   T.click(sw)
   check(T.picker:IsShown() and T.pickerSetups == 1, "picker opened")
   check(T.picker.hasOpacity == false and T.picker.swatchFunc ~= nil and T.picker.cancelFunc ~= nil, "no opacity; swatchFunc and cancelFunc set")
-  check(near(T.picker.previousValues.r, 0.95) and near(T.picker.previousValues.g, 0.20) and near(T.picker.previousValues.b, 0.15), "opened with the saved colour")
+  check(near(T.picker.previousValues.r, 0.95) and near(T.picker.previousValues.g, 0.20) and near(T.picker.previousValues.b, 0.15), "opened with the saved color")
   check(T.pickerEarly == 1, "the mock fired swatchFunc once before Show")
   check(x.stand.colorCalls == calls and sw.Color.vertex == paints, "that early call was ignored (no apply)")
   T.slash("debug") check(T.said("picker=opened"), "debug: picker=opened")
   T.pickColor(0.1, 0.8, 0.2)
   check(rgbIs(ShotWindowDB.color, 0.1, 0.8, 0.2), "live: db (" .. rgbText(ShotWindowDB.color) .. ")")
-  check(rgbIs(x.stand.color, 0.1, 0.8, 0.2), "live: band recoloured (" .. rgbText(x.stand.color) .. ")")
-  check(rgbIs(T.swatchRGB("Zone colour"), 0.1, 0.8, 0.2), "live: swatch repainted")
+  check(rgbIs(x.stand.color, 0.1, 0.8, 0.2), "live: band recolored (" .. rgbText(x.stand.color) .. ")")
+  check(rgbIs(T.swatchRGB("Zone color"), 0.1, 0.8, 0.2), "live: swatch repainted")
   T.pickerOkay()
   check(not T.picker:IsShown() and rgbIs(ShotWindowDB.color, 0.1, 0.8, 0.2) and rgbIs(x.stand.color, 0.1, 0.8, 0.2), "Okay keeps it")
 
   T.click(sw)
-  check(near(T.picker.previousValues.r, 0.1), "reopens with the kept colour")
+  check(near(T.picker.previousValues.r, 0.1), "reopens with the kept color")
   T.pickColor(0.5, 0.5, 0.9)
   check(rgbIs(x.stand.color, 0.5, 0.5, 0.9), "live again")
   T.pickerCancel()
   check(not T.picker:IsShown() and rgbIs(ShotWindowDB.color, 0.1, 0.8, 0.2) and rgbIs(x.stand.color, 0.1, 0.8, 0.2)
-    and rgbIs(T.swatchRGB("Zone colour"), 0.1, 0.8, 0.2), "Cancel restores db, band and swatch")
+    and rgbIs(T.swatchRGB("Zone color"), 0.1, 0.8, 0.2), "Cancel restores db, band and swatch")
 
   T.click(sw) T.pickColor(0.3, 0.3, 0.3)
   T.click(T.checkbox("Show the marker line"))
@@ -1864,43 +2012,43 @@ scenario('options: colour swatches (live, Okay, Cancel, click outside, Escape)',
   T.escape()
   check(not T.picker:IsShown() and rgbIs(ShotWindowDB.color, 0.1, 0.8, 0.2), "Escape cancels")
 
-  local lsw = T.swatch("Line colour")
+  local lsw = T.swatch("Line color")
   T.click(lsw) T.pickColor(0, 0, 1)
-  check(rgbIs(x.line.color, 0, 0, 1) and rgbIs(ShotWindowDB.lineColor, 0, 0, 1), "line colour live")
+  check(rgbIs(x.line.color, 0, 0, 1) and rgbIs(ShotWindowDB.lineColor, 0, 0, 1), "line color live")
   T.pickerOkay()
-  T.click(T.swatch("Fill colour")) T.pickColor(1, 1, 0) T.pickerOkay()
-  check(rgbIs(ShotWindowDB.fillColor, 1, 1, 0) and rgbIs(T.fillTint().color, 1, 1, 0), "fill colour")
+  T.click(T.swatch("Fill color")) T.pickColor(1, 1, 0) T.pickerOkay()
+  check(rgbIs(ShotWindowDB.fillColor, 1, 1, 0) and rgbIs(T.fillTint().color, 1, 1, 0), "fill color")
 
   T.click(sw) T.pickColor(0.6, 0.6, 0.6)
   T.click(lsw)
   check(rgbIs(ShotWindowDB.color, 0.1, 0.8, 0.2), "opening another swatch cancels the first")
-  check(T.picker:IsShown() and near(T.picker.previousValues.b, 1), "and opens on the line colour")
+  check(T.picker:IsShown() and near(T.picker.previousValues.b, 1), "and opens on the line color")
   T.pickerCancel()
-  check(rgbIs(ShotWindowDB.lineColor, 0, 0, 1) and ShotWindowDB.color ~= ShotWindowDB.lineColor, "line colour kept, separate tables")
+  check(rgbIs(ShotWindowDB.lineColor, 0, 0, 1) and ShotWindowDB.color ~= ShotWindowDB.lineColor, "line color kept, separate tables")
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: no colour picker on the client -> message', String.raw`
+scenario('options: no color picker on the client -> message', String.raw`
   ColorPickerFrame = nil
   T.login(200)
   T.slash("")
-  T.click(T.swatch("Zone colour"))
-  check(T.said("this client would not open the colour picker."), "message")
+  T.click(T.swatch("Zone color"))
+  check(T.said("this client would not open the color picker."), "message")
   T.slash("debug") check(T.said("picker=unavailable"), "debug: picker=unavailable")
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: ColorSwatchTemplate missing -> bare swatch from colour textures', String.raw`
+scenario('options: ColorSwatchTemplate missing -> bare swatch from color textures', String.raw`
   T.templates.ColorSwatchTemplate = nil
   T.login(200)
   T.slash("")
-  local sw = T.swatch("Zone colour")
+  local sw = T.swatch("Zone color")
   check(sw ~= nil and sw.template == nil, "a plain Button")
-  check(sw and sw.SwatchBg and sw.InnerBorder and sw.Color and sw.SwatchBg.colorTex and sw.InnerBorder.colorTex and sw.Color.colorTex, "three colour-texture squares")
+  check(sw and sw.SwatchBg and sw.InnerBorder and sw.Color and sw.SwatchBg.colorTex and sw.InnerBorder.colorTex and sw.Color.colorTex, "three color-texture squares")
   check(sw and sw.width == 16 and sw.height == 16, "16x16")
-  check(rgbIs(T.swatchRGB("Zone colour"), 0.95, 0.20, 0.15), "painted")
+  check(rgbIs(T.swatchRGB("Zone color"), 0.95, 0.20, 0.15), "painted")
   T.click(sw) T.pickColor(0, 1, 0) T.pickerOkay()
-  check(rgbIs(ShotWindowDB.color, 0, 1, 0) and rgbIs(T.swatchRGB("Zone colour"), 0, 1, 0), "picks work")
+  check(rgbIs(ShotWindowDB.color, 0, 1, 0) and rgbIs(T.swatchRGB("Zone color"), 0, 1, 0), "picks work")
   T.slash("debug") check(T.said("swatch=bare"), "debug: swatch=bare")
   check(#T.errors == 0, "no errors")
 `);
@@ -1931,7 +2079,7 @@ scenario('options: only OptionsSliderTemplate -> its named labels are stripped',
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: no templates at all -> bare widgets from colour textures', String.raw`
+scenario('options: no templates at all -> bare widgets from color textures', String.raw`
   T.templates = {}
   T.openFails = true
   T.login(200)
@@ -1941,14 +2089,14 @@ scenario('options: no templates at all -> bare widgets from colour textures', St
   local w = T.window()
   check(w and w:IsShown() and T.content():IsVisible(), "bare window shown")
   local bg = w and w.textures[1]
-  check(bg and bg.colorTex and bg.layer == "BACKGROUND", "window background is a colour texture")
+  check(bg and bg.colorTex and bg.layer == "BACKGROUND", "window background is a color texture")
   local cb = T.checkbox("Show the red zone")
-  check(cb and cb:GetCheckedTexture() and cb:GetCheckedTexture().colorTex, "checkbox mark is a colour texture")
+  check(cb and cb:GetCheckedTexture() and cb:GetCheckedTexture().colorTex, "checkbox mark is a color texture")
   T.click(cb) check(ShotWindowDB.band == false and not T.tex().stand.shown, "bare checkbox works")
   local s = T.slider("Extra lead")
-  check(s and s:GetThumbTexture() and s:GetThumbTexture().colorTex and s:GetOrientation() == "HORIZONTAL", "slider thumb is a colour texture")
+  check(s and s:GetThumbTexture() and s:GetThumbTexture().colorTex and s:GetOrientation() == "HORIZONTAL", "slider thumb is a color texture")
   T.drag(s, 40) check(ShotWindowDB.extraLead == 40, "bare slider works")
-  local sw = T.swatch("Zone colour")
+  local sw = T.swatch("Zone color")
   T.click(sw) T.pickColor(0, 0, 1) T.pickerOkay()
   check(rgbIs(ShotWindowDB.color, 0, 0, 1), "bare swatch works")
   local reset = T.button("Defaults")
@@ -1971,9 +2119,9 @@ scenario('options: Defaults resets every key with fresh tables', String.raw`
   T.drag(T.slider("Aim window (the shot's wind-up)"), 300) T.drag(T.slider("Extra lead"), 100) T.drag(T.slider("Thickness"), 5)
   T.drag(T.slider("Zone opacity"), 50) T.drag(T.slider("Brightened opacity"), 90) T.drag(T.slider("Fill opacity"), 40)
   for _, l in ipairs({ "Start earlier by my latency", "Show the marker line", "Show the red zone", "Brighten inside the zone", "Tint the fill inside the zone" }) do T.click(T.checkbox(l)) end
-  T.click(T.swatch("Zone colour")) T.pickColor(0, 0, 0) T.pickerOkay()
-  T.click(T.swatch("Line colour")) T.pickColor(0, 0, 1) T.pickerOkay()
-  T.click(T.swatch("Fill colour")) T.pickColor(1, 1, 0) T.pickerOkay()
+  T.click(T.swatch("Zone color")) T.pickColor(0, 0, 0) T.pickerOkay()
+  T.click(T.swatch("Line color")) T.pickColor(0, 0, 1) T.pickerOkay()
+  T.click(T.swatch("Fill color")) T.pickColor(1, 1, 0) T.pickerOkay()
   T.now = 102.5 T.update()
   check(T.fillTint().shown, "fill tint showing before the reset")
   T.click(T.button("Defaults"))
@@ -1981,17 +2129,17 @@ scenario('options: Defaults resets every key with fresh tables', String.raw`
   local d = ShotWindowDB
   check(d.window == 0.5 and d.latency == true and d.extraLead == 0 and d.band == true and d.idleAlpha == 0.35 and d.flash == true
     and d.activeAlpha == 0.65 and d.line == true and d.lineWidth == 2 and d.fillTint == false and d.fillAlpha == 0.75, "every value back")
-  check(rgbIs(d.color, 0.95, 0.20, 0.15) and rgbIs(d.lineColor, 0.95, 0.20, 0.15) and rgbIs(d.fillColor, 0.95, 0.20, 0.15), "every colour back")
-  check(d.color ~= d.lineColor and d.color ~= d.fillColor and d.lineColor ~= d.fillColor, "three separate colour tables")
+  check(rgbIs(d.color, 0.95, 0.20, 0.15) and rgbIs(d.lineColor, 0.95, 0.20, 0.15) and rgbIs(d.fillColor, 0.95, 0.20, 0.15), "every color back")
+  check(d.color ~= d.lineColor and d.color ~= d.fillColor and d.lineColor ~= d.fillColor, "three separate color tables")
   check(T.slider("Aim window (the shot's wind-up)"):GetValue() == 500 and T.slider("Extra lead"):GetValue() == 0 and T.slider("Thickness"):GetValue() == 2
     and T.slider("Zone opacity"):GetValue() == 35 and T.slider("Brightened opacity"):GetValue() == 65 and T.slider("Fill opacity"):GetValue() == 75, "sliders refreshed")
   check(T.checkbox("Show the red zone"):GetChecked() and T.checkbox("Show the marker line"):GetChecked() and T.checkbox("Brighten inside the zone"):GetChecked()
     and T.checkbox("Start earlier by my latency"):GetChecked() and not T.checkbox("Tint the fill inside the zone"):GetChecked(), "checkboxes refreshed")
-  check(rgbIs(T.swatchRGB("Zone colour"), 0.95, 0.20, 0.15) and rgbIs(T.swatchRGB("Line colour"), 0.95, 0.20, 0.15) and rgbIs(T.swatchRGB("Fill colour"), 0.95, 0.20, 0.15), "swatches repainted")
+  check(rgbIs(T.swatchRGB("Zone color"), 0.95, 0.20, 0.15) and rgbIs(T.swatchRGB("Line color"), 0.95, 0.20, 0.15) and rgbIs(T.swatchRGB("Fill color"), 0.95, 0.20, 0.15), "swatches repainted")
   check(not T.fillTint().shown and alpha() == 0.65 and rgbIs(T.tex().stand.color, 0.95, 0.20, 0.15), "looks back (inside the zone, flash on)")
   checkBands("defaults", 200, 2.8, 0.5, 0)
-  -- the picker edits the colour table in place; a later reset must not inherit that
-  T.click(T.swatch("Zone colour")) T.pickColor(0, 0, 0) T.pickerOkay()
+  -- the picker edits the color table in place; a later reset must not inherit that
+  T.click(T.swatch("Zone color")) T.pickColor(0, 0, 0) T.pickerOkay()
   ShotWindowDB.fillColor[1] = 0
   T.click(T.button("Defaults"))
   check(rgbIs(ShotWindowDB.color, 0.95, 0.20, 0.15) and rgbIs(ShotWindowDB.fillColor, 0.95, 0.20, 0.15), "second reset unaffected by edits to the first reset's tables")
@@ -2022,7 +2170,7 @@ scenario('options: /shotwindow debug prints the options report', String.raw`
   T.slash("debug")
   check(T.said("options: page=registered"), "before opening")
   T.slash("")
-  T.click(T.swatch("Zone colour")) T.pickerCancel()
+  T.click(T.swatch("Zone color")) T.pickerCancel()
   T.slash("debug")
   check(T.said("options: page=registered, open=options page, slider=MinimalSliderTemplate, check=UICheckButtonTemplate, swatch=ColorSwatchTemplate, picker=opened"), "full report")
   check(#T.errors == 0, "no errors")
@@ -2085,7 +2233,7 @@ scenario('options: settings saved by 0.1.0 show on the page', String.raw`
   check(T.slider("Aim window (the shot's wind-up)"):GetValue() == 1000 and T.sliderText("Aim window (the shot's wind-up)") == "1.50 s", "out-of-range window: slider at its end, label from db (" .. tostring(T.sliderText("Aim window (the shot's wind-up)")) .. ")")
   check(ShotWindowDB.window == 1.5, "the refresh does not overwrite the saved window")
   check(T.checkbox("Brighten inside the zone"):GetChecked() == false, "saved flash off shows")
-  check(rgbIs(T.swatchRGB("Zone colour"), 0.2, 0.4, 0.6), "saved colour shows")
+  check(rgbIs(T.swatchRGB("Zone color"), 0.2, 0.4, 0.6), "saved color shows")
   T.drag(T.slider("Aim window (the shot's wind-up)"), 400)
   check(near(ShotWindowDB.window, 0.4), "dragging takes over")
   check(#T.errors == 0, "no errors")
@@ -2145,7 +2293,7 @@ scenario('hold: Auto Shot on keeps the zone lit after the bar ends, steady 0.15 
   check(near(T.standAlpha(), 0.2), "pulse: 0.2 at its low (" .. tostring(T.standAlpha()) .. ")")
   T.now = 102.81 + 0.95 T.update()
   check(near(T.standAlpha(), 1), "pulse: back to 1 after 0.8 s (" .. tostring(T.standAlpha()) .. ")")
-  check(alpha() == 0.65, "the colour keeps the brightened alpha while pulsing")
+  check(alpha() == 0.65, "the color keeps the brightened alpha while pulsing")
   -- the late shot, about 1 s after the bar ended
   T.now = 103.81 T.update()
   local beforeShot = T.alphaCount()
@@ -2499,13 +2647,13 @@ for (const cls of ['MAGE', 'PRIEST', 'WARLOCK']) {
 }
 
 for (const cls of ['ROGUE', 'WARRIOR', 'PALADIN', 'DRUID', 'SHAMAN']) {
-  scenario('no auto-repeating ranged attack (' + cls + '): nothing at all', String.raw`
+  scenario('no auto-repeating ranged attack (' + cls + '): no zone, only the look', String.raw`
     T.className, T.class = "${cls}", "${cls}"
     T.currentMode, T.current[5019], T.current[75] = "plain", true, true
     T.login(200)
-    check(SlashCmdList.SHOTWINDOW == nil and ShotWindowDB == nil, "no slash command, no saved variables")
+    check(SlashCmdList.SHOTWINDOW ~= nil and type(ShotWindowDB) == "table", "slash command and saved variables, for the look")
     check(#T.bar.textures == 0, "nothing drawn")
-    check(#T.settings.canvas == 0, "no options page")
+    check(#T.settings.canvas == 1, "an options page, for the look")
     check(#T.currentQueries == 0, "IsCurrentSpell never asked")
     for e in pairs(T.driver.events) do check(e == "PLAYER_LOGIN", "only PLAYER_LOGIN registered (also " .. e .. ")") end
     T.fire("START_AUTOREPEAT_SPELL") T.fire("PLAYER_SWING", 2.8, 2) T.update()
@@ -2577,48 +2725,48 @@ scenario('options in combat: the window, not the Settings panel; not sticky; the
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: greyed-out controls follow their checkboxes (alpha and mouse)', String.raw`
+scenario('options: grayed-out controls follow their checkboxes (alpha and mouse)', String.raw`
   T.login(200)
   T.slash("")
   T.strictMouse = true
   checkControls("defaults", {
-    ["Thickness"] = "usable", ["Line colour"] = "usable", ["Zone colour"] = "usable", ["Zone opacity"] = "usable",
+    ["Thickness"] = "usable", ["Line color"] = "usable", ["Zone color"] = "usable", ["Zone opacity"] = "usable",
     ["Brighten inside the zone"] = "usable", ["Brightened opacity"] = "usable", ["Pulse while waiting for a late shot"] = "usable",
-    ["Fill colour"] = "greyed", ["Fill opacity"] = "greyed",
+    ["Fill color"] = "grayed", ["Fill opacity"] = "grayed",
     ["Show the red zone"] = "usable", ["Show the marker line"] = "usable", ["Keep the zone lit until the shot fires"] = "usable",
     ["Tint the fill inside the zone"] = "usable", ["Start earlier by my latency"] = "usable", ["Extra lead"] = "usable",
   })
   T.click(T.checkbox("Show the marker line"))
-  checkControls("line off", { ["Thickness"] = "greyed", ["Line colour"] = "greyed", ["Zone colour"] = "usable", ["Show the marker line"] = "usable" })
+  checkControls("line off", { ["Thickness"] = "grayed", ["Line color"] = "grayed", ["Zone color"] = "usable", ["Show the marker line"] = "usable" })
   T.click(T.checkbox("Show the marker line"))
-  checkControls("line on", { ["Thickness"] = "usable", ["Line colour"] = "usable" })
+  checkControls("line on", { ["Thickness"] = "usable", ["Line color"] = "usable" })
   T.click(T.checkbox("Show the red zone"))
-  checkControls("band off", { ["Zone colour"] = "greyed", ["Zone opacity"] = "greyed", ["Brighten inside the zone"] = "greyed",
-    ["Brightened opacity"] = "greyed", ["Pulse while waiting for a late shot"] = "greyed", ["Thickness"] = "usable", ["Show the red zone"] = "usable" })
+  checkControls("band off", { ["Zone color"] = "grayed", ["Zone opacity"] = "grayed", ["Brighten inside the zone"] = "grayed",
+    ["Brightened opacity"] = "grayed", ["Pulse while waiting for a late shot"] = "grayed", ["Thickness"] = "usable", ["Show the red zone"] = "usable" })
   T.click(T.checkbox("Show the red zone"))
-  checkControls("band on", { ["Zone colour"] = "usable", ["Zone opacity"] = "usable", ["Brighten inside the zone"] = "usable",
+  checkControls("band on", { ["Zone color"] = "usable", ["Zone opacity"] = "usable", ["Brighten inside the zone"] = "usable",
     ["Brightened opacity"] = "usable", ["Pulse while waiting for a late shot"] = "usable" })
   T.click(T.checkbox("Brighten inside the zone"))
-  checkControls("flash off", { ["Brightened opacity"] = "greyed", ["Pulse while waiting for a late shot"] = "usable", ["Zone opacity"] = "usable" })
+  checkControls("flash off", { ["Brightened opacity"] = "grayed", ["Pulse while waiting for a late shot"] = "usable", ["Zone opacity"] = "usable" })
   T.click(T.checkbox("Brighten inside the zone"))
   T.click(T.checkbox("Keep the zone lit until the shot fires"))
-  checkControls("hold off", { ["Pulse while waiting for a late shot"] = "greyed", ["Brightened opacity"] = "usable", ["Keep the zone lit until the shot fires"] = "usable" })
+  checkControls("hold off", { ["Pulse while waiting for a late shot"] = "grayed", ["Brightened opacity"] = "usable", ["Keep the zone lit until the shot fires"] = "usable" })
   T.click(T.checkbox("Show the red zone"))
-  checkControls("hold off, band off", { ["Pulse while waiting for a late shot"] = "greyed" })
+  checkControls("hold off, band off", { ["Pulse while waiting for a late shot"] = "grayed" })
   T.click(T.checkbox("Keep the zone lit until the shot fires"))
-  checkControls("hold on, band off", { ["Pulse while waiting for a late shot"] = "greyed" })
+  checkControls("hold on, band off", { ["Pulse while waiting for a late shot"] = "grayed" })
   T.click(T.checkbox("Show the red zone"))
   checkControls("hold on, band on", { ["Pulse while waiting for a late shot"] = "usable" })
   T.click(T.checkbox("Tint the fill inside the zone"))
-  checkControls("fill tint on", { ["Fill colour"] = "usable", ["Fill opacity"] = "usable" })
+  checkControls("fill tint on", { ["Fill color"] = "usable", ["Fill opacity"] = "usable" })
   T.slash("flash")
-  checkControls("/shotwindow flash refreshes", { ["Brightened opacity"] = "greyed" })
+  checkControls("/shotwindow flash refreshes", { ["Brightened opacity"] = "grayed" })
   T.click(T.button("Defaults"))
-  checkControls("after Defaults", { ["Brightened opacity"] = "usable", ["Fill colour"] = "greyed", ["Fill opacity"] = "greyed", ["Pulse while waiting for a late shot"] = "usable" })
+  checkControls("after Defaults", { ["Brightened opacity"] = "usable", ["Fill color"] = "grayed", ["Fill opacity"] = "grayed", ["Pulse while waiting for a late shot"] = "usable" })
   T.closePanel()
   ShotWindowDB.band = false
   T.slash("")
-  checkControls("changed while closed, shown on reopen", { ["Zone colour"] = "greyed", ["Pulse while waiting for a late shot"] = "greyed" })
+  checkControls("changed while closed, shown on reopen", { ["Zone color"] = "grayed", ["Pulse while waiting for a late shot"] = "grayed" })
   check(#T.errors == 0, "no errors")
 `);
 
@@ -2630,22 +2778,22 @@ scenario('options: labels click too (hit rects), swatches sit under the checkbox
     local hi = cb and rawget(cb, "hitInsets")
     check(hi and hi[1] == 0 and hi[2] == -(#l * 6 + 2) and hi[3] == 0 and hi[4] == 0, "checkbox hit rect covers its label: " .. l)
   end
-  local sw = T.swatch("Zone colour")
+  local sw = T.swatch("Zone color")
   local hi = sw and rawget(sw, "hitInsets")
-  check(hi and hi[2] == -(#"Zone colour" * 6 + 6) and hi[3] == -4 and hi[4] == -4, "swatch hit rect covers its label")
+  check(hi and hi[2] == -(#"Zone color" * 6 + 6) and hi[3] == -4 and hi[4] == -4, "swatch hit rect covers its label")
   local cb = T.checkbox("Show the red zone")
   check(sw.points[1][2] == cb.points[1][2] + 4 and sw.points[1][3] == cb.points[1][3] - 28 - 4, "swatch 4 px in and down from the checkbox column")
-  check(cb.width == 24 and sw.width == 16, "checkbox 24 px, swatch 16 px: the swatch is centred in the checkbox column")
+  check(cb.width == 24 and sw.width == 16, "checkbox 24 px, swatch 16 px: the swatch is centered in the checkbox column")
   local function labelX(f) for _, fs in ipairs(f.fontStrings) do local p = fs.points[1] if p and p[1] == "LEFT" and p[2] == f then return p[4] end end end
   check(labelX(cb) and labelX(sw) and cb.points[1][2] + cb.width + labelX(cb) == sw.points[1][2] + sw.width + labelX(sw), "labels start at the same x")
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: every control fits above the Defaults row (CONTENT_H 440)', String.raw`
+scenario('options: every control fits above the Defaults row (CONTENT_H 532)', String.raw`
   T.login(200)
   T.slash("")
   local c = T.content()
-  check(c.height == 440, "content 440 high (" .. tostring(c.height) .. ")")
+  check(c.height == 532, "content 532 high (" .. tostring(c.height) .. ")")
   local reset = T.button("Defaults")
   local rp = reset.points[1]
   local resetTop = -(c.height - rp[3] - reset.height)
@@ -2778,6 +2926,427 @@ scenario('wand user: Shoot (5019) holds and retries like Auto Shot', String.raw`
   T.fire("UNIT_SPELLCAST_FAILED_QUIET", "player", "guid", 75)
   T.now = 106.6 T.update()
   check(T.stateHas("idle"), "an Auto Shot failure does not extend a wand wait")
+  check(#T.errors == 0, "no errors")
+`);
+
+// ---------------------------------------------------------------------------------------------
+// Window styles (Styles.lua, ShotWindow_Skins.lua)
+
+// Lua helpers shared by the style scenarios.
+const STYLE_HELPERS = String.raw`
+  local function under(f, root)
+    while f do
+      if f == root then return true end
+      f = rawget(f, "parent")
+    end
+    return false
+  end
+  local function checkIn(root, label)
+    for _, f in ipairs(T.frames) do
+      if f.kind == "CheckButton" and rawget(f, "parent") == root then
+        for _, fs in ipairs(f.fontStrings) do if rawget(fs, "text") == label then return f end end
+      end
+    end
+  end
+  local function noteOf(c)
+    for _, fs in ipairs(c.fontStrings) do
+      local t = rawget(fs, "text")
+      if t and (t:find("^In use") or t:find("/reload", 1, true)) then return fs end
+    end
+  end
+  local function backdrop(w)
+    for _, t in ipairs(w.textures) do if rawget(t, "gradient") then return t end end
+  end
+  local function skinErrors()
+    local list = {}
+    for k, v in pairs(NS.report) do if k:find("skin error", 1, true) then list[#list + 1] = k .. ": " .. tostring(v) end end
+    return list
+  end
+`;
+
+// A stand-in for EllesmereUI's facade that records every call per frame.
+const EUI_PRE = String.raw`
+  EUIDONE = {}
+  local function rec(name) return function(f) if f then EUIDONE[f] = (EUIDONE[f] or "") .. name .. "," end end end
+  EUI_S = { apiVersion = 3, GetStyle = function() return "eui" end,
+    GetAccentColor = function() return 0.1, 0.6, 0.3 end,
+    GetPanelColor = function() return 0.05, 0.05, 0.06, 0.9 end,
+    OnLooksChanged = function(fn) EUI_LOOKS = fn end }
+  for _, n in ipairs({ "Panel", "Inset", "FadeRegions", "FadeNineSlice", "Button", "WhiteButtonLabel", "StateButtonLabel",
+    "EditBox", "Checkbox", "Dropdown", "ScrollBar", "Tab", "CloseButton", "PageButton", "SquareIcon", "Font", "White" }) do
+    EUI_S[n] = rec(n)
+  end
+  EUI_S.Shell = function(f) -- like EllesmereUI: the border is a frame of its own, high above the window
+    rec("Shell")(f)
+    local border = CreateFrame("Frame", nil, f)
+    border:SetFrameLevel(6)
+    border.euiBorder = true
+  end
+  EllesmereUI = { RegisterSkin = function(name, fn) EUI_REG, EUI_FN = name, fn end, _DispatchSkinRegistration = function() end }
+`;
+
+scenario('styles: Blizzard by default draws nothing; the Look section on the page', STYLE_HELPERS + String.raw`
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(ShotWindowDB.style == "auto" and ShotWindowDB.darkAlpha == 0.92, "style defaults")
+  check(NS.Styles.S == nil, "no drawing calls in use")
+  check(NS.report.skin == "Blizzard (EllesmereUI is not loaded)", "skin line (" .. tostring(NS.report.skin) .. ")")
+  T.slash("")
+  local c = T.content()
+  local b = T.button("Window style: Automatic")
+  check(b ~= nil and b:GetParent() == c, "style button names the style")
+  local note = noteOf(c)
+  check(note and note.text == "In use: Blizzard (EllesmereUI is not loaded).", "note line (" .. tostring(note and note.text) .. ")")
+  local holder = T.slider("Dark background opacity") and T.slider("Dark background opacity").parent
+  check(holder ~= nil, "opacity slider")
+  check(T.slider("Dark background opacity"):GetValue() == 92 and T.sliderText("Dark background opacity") == "92%", "opacity slider read from db")
+  check(T.controlState("Dark background opacity") == "grayed", "opacity grayed for Automatic (" .. T.controlState("Dark background opacity") .. ")")
+  -- placed in order: button, note (two lines), slider
+  local by, ny, hy = b.points[1][3], note.points[1][3], holder.points[1][3]
+  check(ny <= by - 22 and hy <= ny - 24, "button, note and slider do not overlap (" .. by .. ", " .. ny .. ", " .. hy .. ")")
+  local cb = T.checkbox("Show the red zone")
+  check(#cb.textures == 1 and #b.textures == 3, "controls keep the game's art (" .. #cb.textures .. ", " .. #b.textures .. ")")
+  check(T.flatArt == nil, "nothing flat drawn")
+  T.fireScript(b, "OnEnter")
+  check(T.tooltipHas("Automatic: EllesmereUI's look") and T.tooltipHas("Dark: a flat dark style built in")
+    and T.tooltipHas("right-click for the previous one"), "style tooltip")
+  T.fireScript(holder, "OnEnter")
+  check(T.tooltipHas("Dark background opacity") and T.tooltipHas("Applies to the Dark style only."), "opacity tooltip says Dark only")
+  T.fireScript(T.slider("Dark background opacity"), "OnEnter")
+  check(T.tooltipHas("Applies to the Dark style only."), "the slider shows the same tooltip")
+  T.slash("debug")
+  check(T.said("skin: Blizzard (EllesmereUI is not loaded)"), "debug shows the skin line")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('styles: Blizzard to Dark from the Look button draws at once; opacity live; reload prompt when leaving', STYLE_HELPERS + String.raw`
+  T.openFails = true
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  T.slash("")
+  local w = T.window()
+  local shared = T.content()
+  check(w and shared:GetParent() == w and #T.contents() == 1, "Blizzard: the shared controls in the window")
+  check(not w.swSkinned, "window not drawn on")
+  local before = #w.textures
+  T.click(T.button("Window style: Automatic"), "RightButton")
+  check(ShotWindowDB.style == "dark", "right-click steps back to Dark (" .. tostring(ShotWindowDB.style) .. ")")
+  check(NS.report.skin == "Dark", "Dark drawn at once (" .. tostring(NS.report.skin) .. ")")
+  check(not (ShotWindowReloadPrompt and ShotWindowReloadPrompt:IsShown()), "no reload prompt from Blizzard to Dark")
+  check(#w.textures - before == 11, "window: backdrop, title strip, rule and edges (" .. (#w.textures - before) .. " textures)")
+  check(rawget(w.Bg, "alpha") == 0, "template background faded")
+  local own = T.content()
+  check(own ~= shared and own:GetParent() == w and own:IsVisible() and not shared:IsVisible(), "the open window swapped to its own copy")
+  check(#T.contents() == 2, "two builds: the page's and the window's (" .. #T.contents() .. ")")
+  local strokes = 0
+  for _, t in ipairs(w.CloseButton.textures) do if rawget(t, "rotation") then strokes = strokes + 1 end end
+  check(strokes == 2 and rawget(w.CloseButton.textures[1], "alpha") == 0, "close button drawn as an X over faded art")
+  check(w.CloseButton:GetFrameLevel() >= 1, "close button raised")
+  local cb = T.checkbox("Show the red zone")
+  check(cb:GetParent() == own and #cb.textures >= 7, "checkbox drawn (" .. #cb.textures .. " textures)")
+  check(cb.checkedTex.vertex and near(cb.checkedTex.vertex[1], 0.5) and near(cb.checkedTex.vertex[3], 1), "check mark in the accent")
+  local thumb = T.slider("Zone opacity").thumb
+  check(thumb.colorTex and near(thumb.colorTex[1], 0.5) and near(thumb.colorTex[2], 0.82) and rawget(thumb, "alpha") == 1, "slider thumb flat, in the accent")
+  check(#T.button("Defaults").textures > 3 and #T.button("Window style: Dark").textures > 3, "buttons drawn")
+  local pcb = checkIn(shared, "Show the red zone")
+  check(pcb and #pcb.textures == 1, "the shared copy (the Options page's) keeps the game's look")
+  check(T.controlState("Dark background opacity") == "usable", "opacity live for Dark (" .. T.controlState("Dark background opacity") .. ")")
+  local bg = backdrop(w)
+  check(bg and near(bg.gradient[2].a, 0.92) and near(bg.gradient[3].a, 0.92), "backdrop opacity from the settings")
+  T.drag(T.slider("Dark background opacity"), 50)
+  check(ShotWindowDB.darkAlpha == 0.5 and near(bg.gradient[2].a, 0.5) and near(bg.gradient[3].a, 0.5), "opacity slider applies live")
+  T.click(T.button("Window style: Dark"))
+  check(ShotWindowDB.style == "auto", "left-click steps on to Automatic (" .. tostring(ShotWindowDB.style) .. ")")
+  local p = ShotWindowReloadPrompt
+  check(p and p:IsShown() and p.text.text:find("takes a reload", 1, true) ~= nil, "reload prompt when leaving Dark")
+  check(NS.report.skin == "Dark, Blizzard after a /reload", "skin line says what a reload brings (" .. tostring(NS.report.skin) .. ")")
+  check(noteOf(own) and noteOf(own).text:find("Type /reload", 1, true) ~= nil, "note line says so")
+  check(T.controlState("Dark background opacity") == "grayed", "opacity grayed again")
+  check(p and backdrop(p) ~= nil, "the prompt is drawn in the style in use")
+  T.click(p.reload)
+  check(T.reloads == 1, "Reload now reloads")
+  T.slash("style dark")
+  check(not p:IsShown() and T.said("window style Dark. In use: Dark."), "back to Dark: prompt gone")
+  local errs = skinErrors()
+  check(#errs == 0, "no skin errors (" .. table.concat(errs, "; ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('styles: Dark from the saved setting is drawn when the world is up; the page keeps the game look', STYLE_HELPERS + String.raw`
+  ShotWindowDB = { style = "dark" }
+  T.login(200)
+  check(NS.Styles.S == nil, "nothing drawn before the world is up")
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.report.skin == "Dark", "Dark (" .. tostring(NS.report.skin) .. ")")
+  T.slash("")
+  local page, c = T.page(), T.content()
+  check(c:GetParent() == page and #T.contents() == 1, "page: the shared controls, no copy")
+  check(#T.checkbox("Show the red zone").textures == 1 and #T.button("Defaults").textures == 3, "page controls keep the game's look")
+  check(T.controlState("Dark background opacity") == "usable", "opacity live on the page too")
+  T.closePanel()
+  T.openFails = true
+  T.slash("")
+  local w = T.window()
+  check(w and w:IsShown() and w.swSkinned, "fallback window, drawn on")
+  local own = T.content()
+  check(own ~= c and own:GetParent() == w and own:IsVisible() and #T.contents() == 2, "the window has its own copy")
+  check(#T.checkbox("Show the red zone").textures > 1, "its controls drawn")
+  T.click(T.checkbox("Show the red zone"))
+  check(ShotWindowDB.band == false, "the window copy works")
+  T.drag(T.slider("Thickness"), 4)
+  check(ShotWindowDB.lineWidth == 4, "its sliders work")
+  T.openPanelManually()
+  check(not w:IsShown() and c:GetParent() == page and c:IsVisible(), "the page takes over")
+  check(checkIn(c, "Show the red zone"):GetChecked() == false and T.slider("Thickness") ~= nil, "the page shows the change")
+  T.slash("")
+  check(SettingsPanel:IsShown(), "still on the page")
+  local errs = skinErrors()
+  check(#errs == 0, "no skin errors (" .. table.concat(errs, "; ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('styles: Defaults returns the style to Automatic and offers the reload', STYLE_HELPERS + String.raw`
+  ShotWindowDB = { style = "dark", darkAlpha = 0.4 }
+  T.openFails = true
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  T.slash("")
+  local bg = backdrop(T.window())
+  check(bg and near(bg.gradient[2].a, 0.4), "saved opacity used")
+  T.click(T.button("Defaults"))
+  check(ShotWindowDB.style == "auto" and ShotWindowDB.darkAlpha == 0.92, "reset")
+  check(near(bg.gradient[2].a, 0.92), "opacity back to the default on screen")
+  check(ShotWindowReloadPrompt and ShotWindowReloadPrompt:IsShown(), "reload prompt")
+  check(T.controlState("Dark background opacity") == "grayed", "opacity grayed")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('styles: /shotwindow style', STYLE_HELPERS + String.raw`
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  T.slash("style blizzard")
+  check(ShotWindowDB.style == "blizzard" and T.said("window style Blizzard. In use: Blizzard."), "blizzard")
+  T.slash("style Automatic")
+  check(ShotWindowDB.style == "auto" and T.said("window style Automatic. In use: Blizzard (EllesmereUI is not loaded)."), "automatic")
+  T.slash("style purple")
+  check(ShotWindowDB.style == "auto" and T.said("styles: auto, blizzard, dark"), "unknown style refused")
+  T.slash("style")
+  check(ShotWindowDB.style == "blizzard", "no argument steps to the next")
+  T.slash("help")
+  check(T.said("/shotwindow style [auto|blizzard|dark]  - the options window's look (now Blizzard)"), "listed in the usage")
+  T.slash("style dark")
+  check(NS.report.skin == "Dark" and not (ShotWindowReloadPrompt and ShotWindowReloadPrompt:IsShown()), "Dark drawn at once")
+  T.slash("style blizzard")
+  check(ShotWindowReloadPrompt:IsShown() and T.said("Type /reload to switch to Blizzard."), "leaving Dark asks for a reload")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('styles: EllesmereUI hands over its calls; the window and its copy use them, the page copy does not', STYLE_HELPERS + String.raw`
+  T.openFails = true
+  T.login(200)
+  check(EUI_REG == "ShotWindow" and type(EUI_FN) == "function", "registered with EllesmereUI under the folder name")
+  EUI_FN(EUI_S) -- EllesmereUI calls back at login
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.Styles.S == EUI_S, "its calls are the ones in use")
+  check(NS.report.skin == "EllesmereUI (eui style)", "skin line (" .. tostring(NS.report.skin) .. ")")
+  T.slash("")
+  local w = T.window()
+  local function did(f, what) return f ~= nil and (EUIDONE[f] or ""):find(what, 1, true) ~= nil end
+  check(did(w, "Shell") and did(w.Inset, "Inset") and did(w.CloseButton, "CloseButton"), "window: shell, inset, close button")
+  check(did(w.TitleContainer.TitleText, "Font"), "title font")
+  local border
+  for _, ch in ipairs(w.children) do if rawget(ch, "euiBorder") then border = ch end end
+  check(border and w.CloseButton:GetFrameLevel() > border:GetFrameLevel(), "close button above EllesmereUI's border frame")
+  local own, shared = T.content(), T.contents()[1]
+  check(own ~= shared and own:GetParent() == w, "the window has its own copy")
+  check(did(T.checkbox("Show the red zone"), "Checkbox") and did(T.checkbox("Brighten inside the zone"), "Checkbox"), "checkboxes")
+  check(did(T.button("Defaults"), "Button") and did(T.button("Defaults"), "WhiteButtonLabel"), "Defaults button")
+  check(did(T.button("Window style: Automatic"), "Button"), "style button")
+  check(did(T.slider("Zone opacity"), "FadeRegions"), "slider art faded")
+  local thumb = T.slider("Zone opacity").thumb
+  check(thumb.colorTex and near(thumb.colorTex[1], 0.1) and near(thumb.colorTex[2], 0.6), "thumb in EllesmereUI's accent")
+  EUI_S.GetAccentColor = function() return 1, 0, 0 end
+  check(type(EUI_LOOKS) == "function", "listens for look changes")
+  if EUI_LOOKS then EUI_LOOKS() end
+  check(near(thumb.colorTex[1], 1) and near(thumb.colorTex[2], 0), "recolored live")
+  local touched = 0
+  for f in pairs(EUIDONE) do if under(f, shared) then touched = touched + 1 end end
+  check(touched == 0, "nothing on the shared copy (the Options page's) restyled (" .. touched .. ")")
+  check(T.controlState("Dark background opacity") == "grayed", "opacity grayed under EllesmereUI")
+  T.slash("debug")
+  check(T.said("skin: EllesmereUI (eui style)"), "debug shows it")
+  local errs = skinErrors()
+  check(#errs == 0, "no skin errors (" .. table.concat(errs, "; ") .. ")")
+  check(#T.errors == 0, "no errors")
+`, EUI_PRE);
+
+scenario('styles: EllesmereUI loaded but switched off for Shot Window: Blizzard, and says why', STYLE_HELPERS + String.raw`
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.Styles.S == nil and next(EUIDONE) == nil, "nothing drawn")
+  check(NS.report.skin == "Blizzard (switched off for Shot Window in EllesmereUI's options)", "skin line (" .. tostring(NS.report.skin) .. ")")
+  check(NS.Styles.Note() == "In use: Blizzard (switched off for Shot Window in EllesmereUI's options).", "the note gives the reason (" .. tostring(NS.Styles.Note()) .. ")")
+  check(#T.errors == 0, "no errors")
+`, EUI_PRE);
+
+scenario('styles: Blizzard chosen while EllesmereUI runs draws nothing', STYLE_HELPERS + String.raw`
+  ShotWindowDB = { style = "blizzard" }
+  T.openFails = true
+  T.login(200)
+  EUI_FN(EUI_S)
+  T.fire("PLAYER_ENTERING_WORLD")
+  T.slash("")
+  check(NS.Styles.S == nil and next(EUIDONE) == nil, "nothing drawn")
+  check(#T.contents() == 1 and T.content():GetParent() == T.window(), "the window shows the shared controls")
+  check(NS.report.skin == "Blizzard (chosen in the options)", "skin line (" .. tostring(NS.report.skin) .. ")")
+  T.slash("style auto")
+  check(NS.report.skin == "EllesmereUI (eui style)" and not (ShotWindowReloadPrompt and ShotWindowReloadPrompt:IsShown()), "Automatic draws EllesmereUI's look at once")
+  check((EUIDONE[T.window()] or ""):find("Shell", 1, true) ~= nil and T.content() ~= T.contents()[1], "the open window swaps to a restyled copy")
+  check(#T.errors == 0, "no errors")
+`, EUI_PRE);
+
+// ---------------------------------------------------------------------------------------------
+// The swing timer bars in the window styles
+
+const BAR_HELPERS = String.raw`
+  -- What a style left on a bar: the track, the edge, and the flat fill.
+  local function flatParts(bar)
+    local out = { edges = 0 }
+    for _, t in ipairs(bar.textures) do
+      if t.layer == "BACKGROUND" and t.sublevel == -8 then out.track = t
+      elseif t.layer == "BACKGROUND" and t.sublevel == 7 then out.edges = out.edges + 1
+      elseif t.layer == "ARTWORK" and t.sublevel == 1 then out.fill = t end
+    end
+    return out
+  end
+  local function emptied(art) return rawget(art, "color") and art.color[4] == 0 end
+  local function untouched(frame, bar)
+    return rawget(frame.Background, "color") == false and rawget(frame.Border, "color") == false
+      and rawget(bar.Pip, "alpha") == nil and flatParts(bar).track == nil and flatParts(bar).fill == nil
+  end
+  local function rgbNear(c, r, g, b) return type(c) == "table" and near(c[1], r) and near(c[2], g) and near(c[3], b) end
+`;
+
+scenario('swing bars: Blizzard leaves them exactly as the game draws them', BAR_HELPERS + String.raw`
+  local mainFrame, mainBar = T.makeSwing("SwingTimerMainHandFrame", 200)
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  local ranged = SwingTimerRangedFrame
+  check(untouched(ranged, T.bar), "ranged bar: art, pip, nothing of ours but the zone")
+  check(untouched(mainFrame, mainBar) and #mainBar.textures == 0, "main hand bar untouched")
+  check(#T.bar.textures == 4, "only the red zone, its line and the tint on the ranged bar, beside its own fill (" .. #T.bar.textures .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('swing bars: Dark gives every swing bar the flat look and keeps the red zone on top', BAR_HELPERS + String.raw`
+  local mainFrame, mainBar = T.makeSwing("SwingTimerMainHandFrame", 200)
+  local offFrame, offBar = T.makeSwing("SwingTimerOffHandFrame", 200)
+  ShotWindowDB = { style = "dark" }
+  T.login(200)
+  local ranged = SwingTimerRangedFrame
+  check(untouched(ranged, T.bar), "nothing drawn before the world is up")
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.report.skin == "Dark", "Dark (" .. tostring(NS.report.skin) .. ")")
+  for _, pair in ipairs({ { ranged, T.bar, "ranged" }, { mainFrame, mainBar, "main hand" }, { offFrame, offBar, "off hand" } }) do
+    local frame, bar, what = pair[1], pair[2], pair[3]
+    local parts = flatParts(bar)
+    check(emptied(frame.Background) and emptied(frame.Border), what .. ": Blizzard's background and border art emptied in place")
+    check(frame.Background.shown and frame.Border.shown and #frame.Background.points == 0, what .. ": never hidden or moved")
+    check(rawget(bar.Pip, "alpha") == 0, what .. ": the pip faded")
+    check(parts.track and parts.track.allPoints == bar and parts.track.color[4] == 0.85, what .. ": a dark track over the bar")
+    check(parts.edges == 4, what .. ": a thin edge round it (" .. parts.edges .. " lines)")
+    check(parts.fill and parts.fill.allPoints == bar:GetStatusBarTexture() and rgbNear(parts.fill.color, 0.5, 0.82, 1)
+      and parts.fill.color[4] == 1, what .. ": a flat fill in the accent, following Blizzard's fill")
+  end
+  local x = T.tex()
+  check(x.stand.sublevel == 6 and x.line.sublevel == 7 and T.fillTint().sublevel == 5 and flatParts(T.bar).fill.sublevel == 1,
+    "the red zone, its line and the tint stay above the flat fill")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  checkSpan("red zone on the flat bar", x.stand, ${RED_X}, 200)
+  checkLine("red line on the flat bar", x.line, ${RED_X})
+  T.now = 102.4 T.update()
+  check(alpha() == 0.65, "and it still brightens inside the zone")
+  -- Blizzard sets the background and border alpha itself when the target goes out of range or back.
+  ranged.Background:SetAlpha(1) ranged.Border:SetAlpha(0.4)
+  check(emptied(ranged.Background) and emptied(ranged.Border), "a range change cannot bring the art back")
+  local before = #T.bar.textures
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(#T.bar.textures == before, "drawn once, not again on the next loading screen")
+  local errs = {}
+  for k, v in pairs(NS.report) do if k:find("skin error", 1, true) then errs[#errs + 1] = k .. ": " .. tostring(v) end end
+  check(#errs == 0, "no skin errors (" .. table.concat(errs, "; ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('swing bars: Blizzard to Dark live draws them at once', BAR_HELPERS + String.raw`
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(untouched(SwingTimerRangedFrame, T.bar), "Blizzard first")
+  T.slash("style dark")
+  check(emptied(SwingTimerRangedFrame.Background) and flatParts(T.bar).fill ~= nil, "Dark drawn on the bar at once")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('swing bars: a bar that loads after login is drawn flat when Shot Window attaches to it', BAR_HELPERS + String.raw`
+  ShotWindowDB = { style = "dark" }
+  T.fire("PLAYER_LOGIN") -- no swing timer frame yet
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.report.skin == "Dark", "Dark")
+  T.makeBar(200)
+  T.fire("ADDON_LOADED", "Blizzard_SwingTimer")
+  check(emptied(SwingTimerRangedFrame.Background) and flatParts(T.bar).fill ~= nil and #T.bar.textures >= 3, "flat once attached")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('swing bars: EllesmereUI flattens them in its accent and recolors them live', BAR_HELPERS + String.raw`
+  T.login(200)
+  EUI_FN(EUI_S)
+  T.fire("PLAYER_ENTERING_WORLD")
+  local parts = flatParts(T.bar)
+  check(emptied(SwingTimerRangedFrame.Background) and parts.fill and rgbNear(parts.fill.color, 0.1, 0.6, 0.3), "flat, in EllesmereUI's accent")
+  check(parts.track and near(parts.track.color[1], 0.05), "track in its panel color")
+  check((EUIDONE[T.bar.TypeLabel] or ""):find("Font", 1, true) ~= nil and (EUIDONE[T.bar.TimeLabel] or ""):find("Font", 1, true) ~= nil,
+    "the bar's labels in its font")
+  EUI_S.GetAccentColor = function() return 1, 0, 0 end
+  if EUI_LOOKS then EUI_LOOKS() end
+  check(rgbNear(parts.fill.color, 1, 0, 0), "recolored when its accent changes")
+  check(#T.errors == 0, "no errors")
+`, EUI_PRE);
+
+scenario('swing bars: a warrior gets the flat bars under EllesmereUI, and no zone', BAR_HELPERS + String.raw`
+  T.className, T.class = "Warrior", "WARRIOR"
+  local mainFrame, mainBar = T.makeSwing("SwingTimerMainHandFrame", 200)
+  T.login(200)
+  EUI_FN(EUI_S)
+  T.fire("PLAYER_ENTERING_WORLD")
+  for _, pair in ipairs({ { mainFrame, mainBar, "main hand" }, { SwingTimerRangedFrame, T.bar, "ranged" } }) do
+    local parts = flatParts(pair[2])
+    check(emptied(pair[1].Background) and parts.track and parts.edges == 4 and parts.fill and rgbNear(parts.fill.color, 0.1, 0.6, 0.3),
+      pair[3] .. ": flat, in EllesmereUI's accent")
+  end
+  local zone = 0
+  for _, t in ipairs(T.bar.textures) do if t.layer == "ARTWORK" and t.sublevel >= 5 then zone = zone + 1 end end
+  check(zone == 0, "no red zone, line or tint (" .. zone .. ")")
+  for e in pairs(T.driver.events) do check(e == "PLAYER_LOGIN", "only PLAYER_LOGIN registered (also " .. e .. ")") end
+  T.now = 100 T.fire("PLAYER_SWING", 2.0, 0) T.update()
+  check(T.driver.scripts.OnUpdate == nil, "no clock running")
+  check(#T.errors == 0, "no errors")
+`, EUI_PRE);
+
+scenario('swing bars: a druid in Dark, the swing timer loading after login, gets flat bars when it arrives', BAR_HELPERS + String.raw`
+  T.className, T.class = "Druid", "DRUID"
+  ShotWindowDB = { style = "dark" }
+  T.fire("PLAYER_LOGIN") -- no swing timer frames yet
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.report.skin == "Dark" and T.driver.events.ADDON_LOADED == true, "Dark, waiting for the swing timer")
+  local mainFrame, mainBar = T.makeSwing("SwingTimerMainHandFrame", 200)
+  T.makeBar(200)
+  T.fire("ADDON_LOADED", "Blizzard_SwingTimer")
+  check(emptied(mainFrame.Background) and flatParts(mainBar).fill ~= nil and flatParts(T.bar).fill ~= nil, "both bars flat once it loads")
+  check(T.driver.events.ADDON_LOADED == nil, "stops listening")
+  local zone = 0
+  for _, t in ipairs(T.bar.textures) do if t.layer == "ARTWORK" and t.sublevel >= 5 then zone = zone + 1 end end
+  check(zone == 0, "and nothing of the zone")
   check(#T.errors == 0, "no errors")
 `);
 

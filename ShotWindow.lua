@@ -7,13 +7,15 @@
 -- draw a red zone over that end of the bar's StatusBar, starting earlier by the round trip to the
 -- server so a stop at the line reaches the server in time. When the shot is late the game's bar
 -- empties anyway; we keep the zone lit until the shot is reported.
--- Nothing of Blizzard's is read back or changed; we only add textures to its StatusBar.
+-- Nothing of Blizzard's is read back or changed; we only add textures to its StatusBar. The one
+-- exception is a drawn window style (ShotWindow_Skins.lua), which empties the bar frame's own
+-- background and border art so its flat look can show.
 --
 -- On Forever, Auto Shot fires during cast-time shots, so casts need no marker.
 
 local ADDON, ns = ...
 
-ns.VERSION = "0.1.0"
+ns.VERSION = "0.2.0"
 
 local RANGED = Enum and Enum.PlayerSwingType and Enum.PlayerSwingType.Ranged or 2
 local RED = { 0.95, 0.20, 0.15 }
@@ -39,9 +41,14 @@ local DEFAULTS = {
 	fillTint = false, -- turn the bar's fill red while the swing is inside the zone
 	fillColor = { RED[1], RED[2], RED[3] },
 	fillAlpha = 0.75,
+	-- Look of the options window (Styles.lua)
+	style = "auto",  -- "auto" (EllesmereUI when it is running), "blizzard" or "dark"
+	darkAlpha = 0.92, -- background opacity of the Dark style
 }
 
 local db
+ns.report = {} -- lines for /shotwindow debug; Styles.lua adds "skin" here
+function ns.DB() return db end
 local bar            -- SwingTimerRangedFrame.StatusBar
 local tex = {}       -- our textures on the bar
 local swingDuration  -- seconds, from the last PLAYER_SWING
@@ -126,7 +133,7 @@ local function Lit()
 	return inside and autoRepeat ~= false
 end
 
--- Colours follow the settings and whether the swing is inside the zone.
+-- Colors follow the settings and whether the swing is inside the zone.
 local function ApplyLook()
 	if not tex.stand then return end
 	local lit = Lit()
@@ -342,6 +349,7 @@ local function Attach()
 	inside = false
 	ApplyLook()
 	Layout()
+	if ns.SkinSwingBars then ns.SkinSwingBars() end -- the flat look, when a window style is drawn
 	return true
 end
 
@@ -353,9 +361,10 @@ end
 
 local optionRefreshers = {}
 local content, window, settingsPage, settingsCategory
+local windowContent -- the window's own copy of the controls, made while a style is drawn
 local nativeOpenFailed, toldToClose = false, false
 local optionsReport = {} -- printed by /shotwindow debug
-local W, CONTENT_H = 600, 440
+local W, CONTENT_H = 600, 532
 local COL, LEFT, RIGHT = 290, 8, 304
 local sliderCount = 0
 
@@ -367,7 +376,7 @@ local function TryCreate(kind, name, parent, templates)
 	return CreateFrame(kind, name, parent), "bare"
 end
 
--- A button with no template: colour textures and our own label (Interface\Buttons art does not
+-- A button with no template: color textures and our own label (Interface\Buttons art does not
 -- render on this client).
 local function DressBare(b, w, h, label)
 	b:SetSize(w, h)
@@ -383,15 +392,21 @@ local function DressBare(b, w, h, label)
 	b:SetText(label)
 end
 
--- Greys out a control whose setting does nothing right now (its checkbox is off).
+-- Grays out a control whose setting does nothing right now (its checkbox is off).
 local function SetUsable(frame, on)
 	frame:SetAlpha(on and 1 or 0.45)
 	frame:EnableMouse(on)
 end
 
 RefreshOptions = function()
-	if not (content and content:IsVisible()) then return end
+	if not ((content and content:IsVisible()) or (windowContent and windowContent:IsVisible())) then return end
 	for _, refresh in ipairs(optionRefreshers) do refresh() end
+end
+
+-- Each copy of the controls lists its pieces, for the window styles (ShotWindow_Skins.lua).
+local function Keep(parent, kind, part)
+	local list = parent.swParts[kind]
+	list[#list + 1] = part
 end
 
 local function Header(parent, text, x, y)
@@ -402,14 +417,15 @@ local function Header(parent, text, x, y)
 	rule:SetColorTexture(1, 0.82, 0, 0.25)
 	rule:SetPoint("TOPLEFT", x + 4, y - 20)
 	rule:SetSize(COL - 20, 1)
+	Keep(parent, "headers", { text = h, rule = rule })
 	return y - 28
 end
 
--- enabled(), when given, greys the control out while it returns false.
+-- enabled(), when given, grays the control out while it returns false.
 local function OptionCheck(parent, label, key, x, y, enabled)
 	local cb, used = TryCreate("CheckButton", nil, parent, { "UICheckButtonTemplate", "ChatConfigCheckButtonTemplate" })
 	optionsReport.check = used
-	if used == "bare" then -- colour textures only: Interface\Buttons art does not render here
+	if used == "bare" then -- color textures only: Interface\Buttons art does not render here
 		local box = cb:CreateTexture(nil, "BACKGROUND")
 		box:SetAllPoints()
 		box:SetColorTexture(0, 0, 0, 0.6)
@@ -425,6 +441,7 @@ local function OptionCheck(parent, label, key, x, y, enabled)
 	fs:SetPoint("LEFT", cb, "RIGHT", 2, 0)
 	fs:SetText(label)
 	cb:SetHitRectInsets(0, -(fs:GetStringWidth() + 2), 0, 0) -- the label clicks too
+	Keep(parent, "checks", { button = cb, label = fs })
 	cb:SetScript("OnClick", function(self)
 		db[key] = self:GetChecked() and true or false
 		ApplySettings()
@@ -472,6 +489,7 @@ local function OptionSlider(parent, label, x, y, minV, maxV, step, get, set, fmt
 	slider:SetMinMaxValues(minV, maxV) -- before the script: clamping fires OnValueChanged
 	if slider.SetValueStep then slider:SetValueStep(step) end
 	if slider.SetObeyStepOnDrag then pcall(slider.SetObeyStepOnDrag, slider, true) end
+	Keep(parent, "sliders", { slider = slider, caption = caption, value = value })
 	slider:SetScript("OnValueChanged", function(self, v)
 		v = math.floor(v / step + 0.5) * step
 		value:SetText(fmt(v))
@@ -491,7 +509,7 @@ local function OptionSlider(parent, label, x, y, minV, maxV, step, get, set, fmt
 			slider:EnableMouse(on)
 		end
 	end
-	return y - 46
+	return y - 46, holder, slider
 end
 
 local function Percent(key)
@@ -500,8 +518,8 @@ local function Percent(key)
 		function(v) return v .. "%" end
 end
 
--- Forever loads the retail-style colour picker: SetupColorPickerAndShow with swatchFunc, and
--- GetColorRGB. A click outside it cancels, which restores the colour it opened with.
+-- Forever loads the retail-style color picker: SetupColorPickerAndShow with swatchFunc, and
+-- GetColorRGB. A click outside it cancels, which restores the color it opened with.
 local function OpenColorPicker(color, apply)
 	local picker = ColorPickerFrame
 	if not (picker and picker.SetupColorPickerAndShow and picker.GetColorRGB) then return false end
@@ -525,7 +543,7 @@ end
 
 local function OptionColor(parent, label, key, x, y, enabled)
 	local ok, swatch = pcall(CreateFrame, "Button", nil, parent, "ColorSwatchTemplate")
-	if not ok or not swatch then -- the same look from colour textures
+	if not ok or not swatch then -- the same look from color textures
 		swatch = CreateFrame("Button", nil, parent)
 		swatch:SetSize(16, 16)
 		local function Square(sub, size, r, g, b)
@@ -540,12 +558,13 @@ local function OptionColor(parent, label, key, x, y, enabled)
 		swatch.Color = Square(-1, 10, 1, 1, 1)
 	end
 	optionsReport.swatch = ok and "ColorSwatchTemplate" or "bare"
-	swatch:SetPoint("TOPLEFT", x + 4, y - 4) -- centred under the checkboxes, label in line with theirs
+	swatch:SetPoint("TOPLEFT", x + 4, y - 4) -- centered under the checkboxes, label in line with theirs
 	swatch:RegisterForClicks("LeftButtonUp")
 	local fs = swatch:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 	fs:SetPoint("LEFT", swatch, "RIGHT", 6, 0)
 	fs:SetText(label)
 	swatch:SetHitRectInsets(0, -(fs:GetStringWidth() + 6), -4, -4) -- the label clicks too
+	Keep(parent, "texts", fs)
 	local function Paint()
 		local c = db[key]
 		swatch.Color:SetVertexColor(c[1], c[2], c[3])
@@ -559,7 +578,7 @@ local function OptionColor(parent, label, key, x, y, enabled)
 			ApplySettings()
 		end)
 		optionsReport.picker = opened and "opened" or "unavailable"
-		if not opened then Print("this client would not open the colour picker.") end
+		if not opened then Print("this client would not open the color picker.") end
 	end)
 	optionRefreshers[#optionRefreshers + 1] = Paint
 	return y - 28
@@ -567,16 +586,94 @@ end
 
 local function ResetDefaults()
 	for k, v in pairs(DEFAULTS) do db[k] = Copy(v) end
+	local Styles = ns.Styles
+	if Styles then
+		Styles.SetDarkAlpha(db.darkAlpha)
+		Styles.Changed() -- offers a reload if the style drawn now is no longer the chosen one
+	end
 	ApplySettings()
 	Print("settings reset to the defaults")
 end
 
 local function Is(key) return function() return db[key] and true or false end end
 
+local function Tooltip(frame, title, lines)
+	frame:SetScript("OnEnter", function(self)
+		if not GameTooltip then return end
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(title, 1, 1, 1)
+		for _, line in ipairs(lines()) do GameTooltip:AddLine(line[1], line[2], line[3], line[4], true) end
+		GameTooltip:Show()
+	end)
+	frame:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+end
+
+-- The window style (Styles.lua): a button that steps through the styles, a line saying what is
+-- in use, and the Dark style's opacity, grayed out for the other styles.
+local function OptionStyle(parent, x, y)
+	local button, used = TryCreate("Button", nil, parent, { "UIPanelButtonTemplate" })
+	if used == "bare" then DressBare(button, 200, 22, "") else button:SetSize(200, 22) end
+	button:SetPoint("TOPLEFT", x + 4, y)
+	button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	button:SetScript("OnClick", function(_, which)
+		if ns.Styles then ns.Styles.Cycle(which == "RightButton" and -1 or 1) end
+		RefreshOptions()
+	end)
+	Tooltip(button, "Window style", function()
+		local lines = {}
+		for _, text in ipairs(ns.Styles and ns.Styles.HELP or {}) do lines[#lines + 1] = { text } end
+		lines[#lines + 1] = { "Left-click for the next style, right-click for the previous one.", 0.6, 0.6, 0.6 }
+		return lines
+	end)
+	Keep(parent, "buttons", button)
+	local note = parent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	note:SetPoint("TOPLEFT", x + 4, y - 26)
+	note:SetWidth(COL - 20)
+	note:SetJustifyH("LEFT")
+	Keep(parent, "texts", note)
+	optionRefreshers[#optionRefreshers + 1] = function()
+		local Styles = ns.Styles
+		button:SetText("Window style: " .. (Styles and Styles.Name(db.style) or "Blizzard"))
+		note:SetText(Styles and Styles.Note() or "")
+	end
+	local after, holder, slider = OptionSlider(parent, "Dark background opacity", x, y - 54, 0, 100, 5,
+		function() return math.floor((db.darkAlpha or 0) * 100 + 0.5) end,
+		function(v)
+			db.darkAlpha = v / 100
+			if ns.Styles then ns.Styles.SetDarkAlpha(db.darkAlpha) end
+		end,
+		function(v) return v .. "%" end,
+		function() return db.style == "dark" end)
+	holder:EnableMouse(true) -- the tooltip still shows while the slider is grayed out
+	Tooltip(holder, "Dark background opacity", function()
+		local lines = { { "How much of the world shows through the Dark style's windows." } }
+		if db.style ~= "dark" then lines[2] = { "Applies to the Dark style only.", 1, 0.82, 0 } end
+		return lines
+	end)
+	slider:HookScript("OnEnter", function() holder:GetScript("OnEnter")(holder) end)
+	slider:HookScript("OnLeave", function() holder:GetScript("OnLeave")(holder) end)
+	return after
+end
+
+local BuildFooter -- the row along the bottom, below
+
 local function BuildContent()
 	local c = CreateFrame("Frame")
 	c:SetSize(W, CONTENT_H)
 	c:Hide() -- a shown frame with no parent counts as visible
+	c.swParts = { headers = {}, checks = {}, sliders = {}, buttons = {}, texts = {} }
+
+	-- A class with no Auto Shot or wand Shoot gets the look and nothing else, and is told why.
+	if not shotSpell then
+		local why = c:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		why:SetPoint("TOPLEFT", LEFT + 4, -4)
+		why:SetWidth(W - 24)
+		why:SetJustifyH("LEFT")
+		why:SetText("This character has no Auto Shot or wand Shoot, so there is no stand-still zone. What applies here is the look: under the Dark or EllesmereUI window style, the game's swing timer bars are drawn flat.")
+		Keep(c, "texts", why)
+		OptionStyle(c, LEFT, Header(c, "Look", LEFT, -48))
+		return BuildFooter(c, false)
+	end
 
 	local y = Header(c, "Timing", LEFT, -4)
 	y = OptionSlider(c, "Aim window (the shot's wind-up)", LEFT, y, 0, 1000, 10,
@@ -593,6 +690,7 @@ local function BuildContent()
 	status:SetPoint("TOPLEFT", LEFT + 4, y - 2)
 	status:SetWidth(COL - 20)
 	status:SetJustifyH("LEFT")
+	Keep(c, "texts", status)
 	local function StatusText()
 		return ("Red zone now: the last %.2f s (aim %.2f s + latency %d ms + extra %d ms)"):format(
 			Lead(), db.window, math.floor(Latency() * 1000 + 0.5), math.floor((db.extraLead or 0) + 0.5))
@@ -614,11 +712,14 @@ local function BuildContent()
 		function() return db.lineWidth end,
 		function(v) db.lineWidth = v end,
 		function(v) return v .. " px" end, Is("line"))
-	OptionColor(c, "Line colour", "lineColor", LEFT, y, Is("line"))
+	y = OptionColor(c, "Line color", "lineColor", LEFT, y, Is("line"))
+
+	y = Header(c, "Look", LEFT, y - 8)
+	OptionStyle(c, LEFT, y)
 
 	y = Header(c, "Red zone", RIGHT, -4)
 	y = OptionCheck(c, "Show the red zone", "band", RIGHT, y)
-	y = OptionColor(c, "Zone colour", "color", RIGHT, y, Is("band"))
+	y = OptionColor(c, "Zone color", "color", RIGHT, y, Is("band"))
 	local get, set, fmt = Percent("idleAlpha")
 	y = OptionSlider(c, "Zone opacity", RIGHT, y - 4, 0, 100, 5, get, set, fmt, Is("band"))
 	y = OptionCheck(c, "Brighten inside the zone", "flash", RIGHT, y, Is("band"))
@@ -630,10 +731,14 @@ local function BuildContent()
 
 	y = Header(c, "Bar fill", RIGHT, y - 8)
 	y = OptionCheck(c, "Tint the fill inside the zone", "fillTint", RIGHT, y)
-	y = OptionColor(c, "Fill colour", "fillColor", RIGHT, y, Is("fillTint"))
+	y = OptionColor(c, "Fill color", "fillColor", RIGHT, y, Is("fillTint"))
 	get, set, fmt = Percent("fillAlpha")
 	OptionSlider(c, "Fill opacity", RIGHT, y - 4, 0, 100, 5, get, set, fmt, Is("fillTint"))
+	return BuildFooter(c, true)
+end
 
+-- The Defaults button along the bottom, and the color picker hint where there are colors.
+function BuildFooter(c, colors)
 	local reset, resetUsed = TryCreate("Button", nil, c, { "UIPanelButtonTemplate" })
 	if resetUsed == "bare" then
 		DressBare(reset, 110, 22, "Defaults")
@@ -643,9 +748,12 @@ local function BuildContent()
 	end
 	reset:SetPoint("BOTTOMLEFT", LEFT + 4, 4)
 	reset:SetScript("OnClick", ResetDefaults)
+	Keep(c, "buttons", reset)
+	if not colors then return c end
 	local hint = c:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	hint:SetPoint("LEFT", reset, "RIGHT", 10, 0)
-	hint:SetText("Colour picker: press Okay to keep a colour; clicking elsewhere cancels it.")
+	hint:SetText("Color picker: press Okay to keep a color; clicking elsewhere cancels it.")
+	Keep(c, "texts", hint)
 	return c
 end
 
@@ -660,14 +768,27 @@ local function EnsureContent()
 	return content
 end
 
-local function Host(parent, x, y, scale)
+local function Host(controls, parent, x, y, scale)
 	scale = scale or 1
-	content:SetParent(parent)
-	content:ClearAllPoints()
-	content:SetScale(scale)
-	content:SetPoint("TOPLEFT", parent, "TOPLEFT", x / scale, y / scale)
-	content:Show()
+	controls:SetParent(parent)
+	controls:ClearAllPoints()
+	controls:SetScale(scale)
+	controls:SetPoint("TOPLEFT", parent, "TOPLEFT", x / scale, y / scale)
+	controls:Show()
 	RefreshOptions()
+end
+
+-- While a window style is drawn, the window shows a copy of the controls of its own to restyle,
+-- so the controls on the game's Options page keep the game's look. nil while Blizzard's is used.
+local function WindowContent()
+	if not (ns.Styles and ns.Styles.S) then return nil end
+	if not windowContent then
+		local ok, made = pcall(BuildContent)
+		if not ok then return nil end
+		windowContent = made
+		if ns.SkinContent then ns.SkinContent(made) end
+	end
+	return windowContent
 end
 
 local function BuildWindow()
@@ -675,7 +796,7 @@ local function BuildWindow()
 	local top = template == "ButtonFrameTemplate" and -60 or -28
 	f:SetSize(W, CONTENT_H - top + 10)
 	f:SetPoint("CENTER")
-	f:SetFrameStrata("HIGH") -- below the DIALOG colour picker
+	f:SetFrameStrata("HIGH") -- below the DIALOG color picker
 	f:SetToplevel(true)
 	f:SetMovable(true)
 	f:EnableMouse(true)
@@ -706,18 +827,30 @@ local function BuildWindow()
 		-- No buttons along the bottom: let the inset reach down past the Defaults row.
 		if ButtonFrameTemplate_HideButtonBar then pcall(ButtonFrameTemplate_HideButtonBar, f) end
 	end
-	if not (f.CloseButton or _G.ShotWindowOptionsCloseButton) then
-		local close, used = TryCreate("Button", nil, f, { "UIPanelCloseButton" })
+	local close = f.CloseButton or _G.ShotWindowOptionsCloseButton
+	if not close then
+		local used
+		close, used = TryCreate("Button", nil, f, { "UIPanelCloseButton" })
 		if used == "bare" then
 			DressBare(close, 20, 20, "x")
 			close:SetPoint("TOPRIGHT", -4, -4)
 		else
 			close:SetPoint("TOPRIGHT", 2, 2)
 		end
+		f.swClose = close
+	end
+	-- The template's X runs HideUIPanel, which the game refuses in combat for an addon's window:
+	-- hide it directly so the X works in combat too (OnHide still runs).
+	if type(close) == "table" and close.SetScript then
 		close:SetScript("OnClick", function() f:Hide() end)
 	end
-	f:SetScript("OnShow", function(self) Host(self, 0, top) end)
+	f:SetScript("OnShow", function(self)
+		local own = WindowContent()
+		if own and content and content:GetParent() == self then content:Hide() end
+		Host(own or content, self, 0, top)
+	end)
 	optionsReport.window = template
+	if ns.SkinWindow then ns.SkinWindow(f) end
 	return f
 end
 
@@ -780,7 +913,7 @@ local function RegisterOptionsPage()
 		local w, h = self:GetWidth() or 0, self:GetHeight() or 0
 		local scale = 1
 		if w > 0 and h > 0 then scale = math.min(1, (w - 12) / W, (h - 50) / CONTENT_H) end
-		Host(self, 6, -42, scale)
+		Host(content, self, 6, -42, scale)
 	end)
 	page:SetScript("OnSizeChanged", function(self)
 		if self:IsVisible() and content and content:GetParent() == self then self:GetScript("OnShow")(self) end
@@ -799,6 +932,7 @@ end
 
 local function Debug()
 	Print("version " .. ns.VERSION)
+	if not shotSpell then Print("no stand-still zone on this character (no Auto Shot or wand Shoot): only the look applies") end
 	Print("bar found: " .. tostring(bar ~= nil) .. ", showSwingTimer: " .. tostring(GetCVar and GetCVar("showSwingTimer")))
 	Print(("swing: %s s (weapon %s s)"):format(tostring(swingDuration), tostring(WeaponSpeed())))
 	Print(("red zone: last %.2f s = window %.2f s + latency %d ms + extra %d ms"):format(
@@ -810,19 +944,35 @@ local function Debug()
 		if optionsReport[k] then parts[#parts + 1] = k .. "=" .. optionsReport[k] end
 	end
 	Print("options: " .. (#parts > 0 and table.concat(parts, ", ") or "not opened yet"))
+	Print("skin: " .. tostring(ns.report.skin))
+	for k, v in pairs(ns.report) do
+		if k:find("^skin error") then Print(k .. ": " .. tostring(v)) end
+	end
 end
 
 local function Usage()
+	if not shotSpell then
+		Print("/shotwindow  - open the options (also /shotwindow options)")
+		Print("/shotwindow style [auto|blizzard|dark]  - the window and swing bar look (now " .. ns.Styles.Name(db.style) .. ")")
+		Print("/shotwindow debug")
+		Print("the stand-still zone is for hunters and wand users; this character gets the look only")
+		return
+	end
 	Print("/shotwindow  - open the options (also /shotwindow options)")
 	Print("/shotwindow window <seconds>  - aim time at the end of the swing (now " .. db.window .. ")")
 	Print("/shotwindow latency  - toggle starting the red zone earlier by your latency (now " .. (db.latency and "on" or "off") .. ")")
 	Print("/shotwindow flash  - toggle brightening the red zone while you are in it (now " .. (db.flash and "on" or "off") .. ")")
+	Print("/shotwindow style [auto|blizzard|dark]  - the options window's look (now " .. ns.Styles.Name(db.style) .. ")")
 	Print("/shotwindow debug")
 end
 
 local function Slash(msg)
 	local cmd, rest = (msg or ""):match("^%s*(%S*)%s*(.-)%s*$")
 	cmd = cmd:lower()
+	if not shotSpell and (cmd == "window" or cmd == "latency" or cmd == "flash") then
+		Usage() -- zone settings, and this character has no zone
+		return
+	end
 	if cmd == "" or cmd == "options" or cmd == "config" then
 		ToggleOptions()
 		return
@@ -844,6 +994,18 @@ local function Slash(msg)
 	elseif cmd == "debug" then
 		Debug()
 		return
+	elseif cmd == "style" then
+		local Styles, style = ns.Styles, rest:lower()
+		if style == "auto" or style == "automatic" then Styles.Set("auto")
+		elseif style == "blizzard" or style == "dark" then Styles.Set(style)
+		elseif style == "" then Styles.Cycle(1)
+		else
+			Print("styles: auto, blizzard, dark")
+			return
+		end
+		Print("window style " .. Styles.Name(db.style) .. ". " .. Styles.Note())
+		RefreshOptions()
+		return
 	else
 		Usage()
 		return
@@ -856,7 +1018,6 @@ driver:SetScript("OnEvent", function(self, event, ...)
 	if event == "PLAYER_LOGIN" then
 		local _, class = UnitClass("player")
 		shotSpell = SHOT_SPELL[class]
-		if not shotSpell then return end -- hunters and wand users only
 		ShotWindowDB = CopyDefaults(ShotWindowDB or {}, DEFAULTS)
 		db = ShotWindowDB
 		SLASH_SHOTWINDOW1 = "/shotwindow"
@@ -864,6 +1025,13 @@ driver:SetScript("OnEvent", function(self, event, ...)
 		SlashCmdList.SHOTWINDOW = Slash
 		local ok, err = pcall(RegisterOptionsPage)
 		if not ok then optionsReport.page = "failed: " .. tostring(err) end
+		if not shotSpell then
+			-- No Auto Shot or wand Shoot: no stand-still zone, nothing drawn on the bar, no swing
+			-- events. What is left is the look (ShotWindow_Skins.lua), which every class's swing bars
+			-- get under a drawn window style; it only needs the swing timer frames to exist.
+			if not _G.SwingTimerRangedFrame then self:RegisterEvent("ADDON_LOADED") end
+			return
+		end
 		if not Attach() then
 			-- Blizzard_SwingTimer loads at startup; wait for it rather than ever loading it ourselves.
 			self:RegisterEvent("ADDON_LOADED")
@@ -881,7 +1049,14 @@ driver:SetScript("OnEvent", function(self, event, ...)
 		self:RegisterEvent("UI_SCALE_CHANGED")
 		self:RegisterEvent("DISPLAY_SIZE_CHANGED")
 	elseif event == "ADDON_LOADED" then
-		if Attach() then self:UnregisterEvent("ADDON_LOADED") end
+		if not shotSpell then
+			if _G.SwingTimerRangedFrame then
+				self:UnregisterEvent("ADDON_LOADED")
+				if ns.SkinSwingBars then ns.SkinSwingBars() end
+			end
+		elseif Attach() then
+			self:UnregisterEvent("ADDON_LOADED")
+		end
 	elseif event == "PLAYER_SWING" then
 		OnSwing(...)
 	elseif event == "START_AUTOREPEAT_SPELL" then
