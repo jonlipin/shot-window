@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 - 2026-10-11
+
+- Fixed: with EllesmereUI, a character with no Auto Shot or wand Shoot (a druid, for example) kept the game's own swing timer bars instead of the flat ones. EllesmereUI hands its look over at login just before Shot Window has loaded its settings, and only hunters and wand users had their bars styled again afterwards. Every class gets the flat bars now.
+- Fixed: with EllesmereUI installed, choosing Blizzard or Dark could still give you EllesmereUI's look after logging in, for the same reason. Your saved choice now counts from the start.
+- `/shotwindow debug` says whether each swing timer bar was drawn flat, and what art the main hand and ranged bars show.
+
 ## 0.2.0 - 2026-10-10
 
 - A Look section in the options with a window style: Automatic, Blizzard or Dark. Automatic uses EllesmereUI's look when it is running and Blizzard's otherwise. Dark is a flat dark style built in, so it needs no other addon, and a Dark background opacity slider sets how much of the world shows through it (grayed out unless Dark is chosen). Switching from Blizzard to a drawn style happens at once; leaving a drawn style takes a reload, and Shot Window offers one. Defaults puts the style back to Automatic.

@@ -15,7 +15,7 @@
 
 local ADDON, ns = ...
 
-ns.VERSION = "0.2.0"
+ns.VERSION = "0.2.1"
 
 local RANGED = Enum and Enum.PlayerSwingType and Enum.PlayerSwingType.Ranged or 2
 local RED = { 0.95, 0.20, 0.15 }
@@ -48,7 +48,9 @@ local DEFAULTS = {
 
 local db
 ns.report = {} -- lines for /shotwindow debug; Styles.lua adds "skin" here
-function ns.DB() return db end
+-- Before PLAYER_LOGIN (EllesmereUI hands its look over in its own PLAYER_LOGIN handler, which runs
+-- first) the saved table is already loaded, only not yet topped up: the chosen style is in it.
+function ns.DB() return db or (type(ShotWindowDB) == "table" and ShotWindowDB) or nil end
 local bar            -- SwingTimerRangedFrame.StatusBar
 local tex = {}       -- our textures on the bar
 local swingDuration  -- seconds, from the last PLAYER_SWING
@@ -945,6 +947,18 @@ local function Debug()
 	end
 	Print("options: " .. (#parts > 0 and table.concat(parts, ", ") or "not opened yet"))
 	Print("skin: " .. tostring(ns.report.skin))
+	Print("swing bars: " .. tostring(ns.report["swing bars"] or "never styled"))
+	for _, name in ipairs({ "SwingTimerMainHandFrame", "SwingTimerRangedFrame" }) do
+		local f = _G[name]
+		local bg = type(f) == "table" and f.Background
+		if type(bg) == "table" then
+			local ok, atlas, texture = pcall(function() return bg:GetAtlas(), bg:GetTexture() end)
+			if ok then
+				Print(("%s: shown %s, background atlas %s, texture %s"):format(name, tostring(f:IsShown()),
+					tostring(atlas), tostring(texture)))
+			end
+		end
+	end
 	for k, v in pairs(ns.report) do
 		if k:find("^skin error") then Print(k .. ": " .. tostring(v)) end
 	end
@@ -1029,7 +1043,14 @@ driver:SetScript("OnEvent", function(self, event, ...)
 			-- No Auto Shot or wand Shoot: no stand-still zone, nothing drawn on the bar, no swing
 			-- events. What is left is the look (ShotWindow_Skins.lua), which every class's swing bars
 			-- get under a drawn window style; it only needs the swing timer frames to exist.
-			if not _G.SwingTimerRangedFrame then self:RegisterEvent("ADDON_LOADED") end
+			-- EllesmereUI hands its look over at PLAYER_LOGIN too, and its handler runs before this
+			-- one, while the settings aren't loaded yet; the bars are styled here, now that they are.
+			-- (Attach does the same for hunters and wand users.)
+			if not _G.SwingTimerRangedFrame then
+				self:RegisterEvent("ADDON_LOADED")
+			elseif ns.SkinSwingBars then
+				ns.SkinSwingBars()
+			end
 			return
 		end
 		if not Attach() then

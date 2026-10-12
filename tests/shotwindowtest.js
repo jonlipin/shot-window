@@ -1492,7 +1492,7 @@ scenario('/shotwindow debug, garbage and empty input', String.raw`
   T.login(200)
   T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
   T.slash("debug")
-  check(T.said("version 0.2.0"), "debug: version")
+  check(T.said("version 0.2.1"), "debug: version")
   check(T.said("bar found: true, showSwingTimer: 1"), "debug: bar and cvar")
   check(T.said("swing: 2.8 s (weapon 2.8 s)"), "debug: swing line")
   check(T.said("red zone: last 0.50 s = window 0.50 s + latency 0 ms + extra 0 ms"), "debug: red zone line")
@@ -3330,6 +3330,35 @@ scenario('swing bars: a warrior gets the flat bars under EllesmereUI, and no zon
   for e in pairs(T.driver.events) do check(e == "PLAYER_LOGIN", "only PLAYER_LOGIN registered (also " .. e .. ")") end
   T.now = 100 T.fire("PLAYER_SWING", 2.0, 0) T.update()
   check(T.driver.scripts.OnUpdate == nil, "no clock running")
+  check(#T.errors == 0, "no errors")
+`, EUI_PRE);
+
+scenario('swing bars: a druid under EllesmereUI, whose look arrives before the settings at login, still gets flat bars', BAR_HELPERS + String.raw`
+  -- EllesmereUI's PLAYER_LOGIN handler runs before Shot Window's: its callback comes while the
+  -- settings aren't loaded, so the bars must be styled once they are. (A hunter's Attach did that;
+  -- a class without Auto Shot or a wand used to be left with Blizzard's bars.)
+  T.className, T.class = 'Druid', 'DRUID'
+  local mainFrame, mainBar = T.makeSwing('SwingTimerMainHandFrame', 200)
+  EUI_FN(EUI_S)
+  check(not emptied(mainFrame.Background), 'nothing styled before the settings load')
+  T.login(200)
+  T.fire('PLAYER_ENTERING_WORLD')
+  for _, pair in ipairs({ { mainFrame, mainBar, 'main hand' }, { SwingTimerRangedFrame, T.bar, 'ranged' } }) do
+    local parts = flatParts(pair[2])
+    check(emptied(pair[1].Background) and parts.track and parts.fill and rgbNear(parts.fill.color, 0.1, 0.6, 0.3), pair[3] .. ': flat, in the EllesmereUI accent')
+  end
+  check((NS.report['swing bars'] or ''):find('MainHand flat', 1, true) ~= nil, 'debug says the main hand bar is flat: ' .. tostring(NS.report['swing bars']))
+  check(#T.errors == 0, 'no errors')
+`, EUI_PRE);
+
+scenario('swing bars: Blizzard chosen, EllesmereUI calling back before the settings load, stays Blizzard', BAR_HELPERS + String.raw`
+  -- EllesmereUI's callback comes before Shot Window's PLAYER_LOGIN: the saved choice must already count.
+  ShotWindowDB = { style = "blizzard" }
+  EUI_FN(EUI_S)
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(not emptied(SwingTimerRangedFrame.Background) and flatParts(T.bar).fill == nil, "the game's own bar, not flattened")
+  check((NS.report.skin or ""):find("Blizzard (chosen", 1, true) == 1, "skin line says Blizzard was chosen: " .. tostring(NS.report.skin))
   check(#T.errors == 0, "no errors")
 `, EUI_PRE);
 

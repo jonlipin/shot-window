@@ -99,14 +99,19 @@ end
 -- Every class: the stand-still zone is for hunters and wand users, but the bars' look is for anyone
 -- who chose a drawn style. Waits for the settings, which arrive at login.
 function ns.SkinSwingBars()
-	if not S() or not (ns.DB and ns.DB()) then return end
+	if not S() then ns.report["swing bars"] = "not yet: no style drawn" return end
+	if not (ns.DB and ns.DB()) then ns.report["swing bars"] = "not yet: settings not loaded" return end
+	local parts = {}
 	for _, name in ipairs(SWING_BARS) do
 		local frame = _G[name]
 		local bar = type(frame) == "table" and frame.StatusBar
 		if type(bar) == "table" and not flatBars[bar] then
 			Try("swing bar " .. name, FlatBar, frame, bar)
 		end
+		local short = name:gsub("^SwingTimer", ""):gsub("Frame$", "")
+		parts[#parts + 1] = short .. " " .. (type(bar) ~= "table" and "not found" or (flatBars[bar] and "flat" or "failed"))
 	end
+	ns.report["swing bars"] = table.concat(parts, ", ")
 end
 
 -- ---- the options window ------------------------------------------------------------------------
