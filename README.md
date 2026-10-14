@@ -13,7 +13,7 @@ Turn the game's swing timer on first (Options, Advanced Options, Swing Timer) an
 
 ## Displays
 
-A display is a frame of Shot Window's own, besides the marks on the game's bar. Choose one on the Display tab, where a live preview plays a made-up fight: an ordinary shot, one you move into (so it clips, comes late and the display holds), then one more.
+A display is a frame of Shot Window's own, besides the marks on the game's bar. Choose one on the Display tab. The preview across the top of the options plays a made-up fight on a copy of the game's bar and on your display: an ordinary shot, one you move into (so it clips, comes late and the zone holds), then one more.
 
 - **Classic bar:** one fill, left to right, with the red end as the stand-still zone.
 - **Pincer bar:** two fills race in from the ends; the shot fires where they meet.
@@ -26,6 +26,8 @@ A display is a frame of Shot Window's own, besides the marks on the game's bar. 
 - **Horseshoe arc:** fills climb both sides of an arc and meet at the shot on top.
 - **Ring:** one sweep round to the top, with a countdown inside.
 - **Tightening reticle:** a circle closes on its center at the shot. Put it on your character to keep your eyes there.
+
+The horseshoe's words (Move, Stand still, Moving, Late), the ring's "Late" and the ring's countdown can be turned off on the Display tab.
 
 Every display does everything the marks on the game's bar do: it brightens inside the zone, holds at the shot and pulses while a shot is late, turns the clip color when you move inside the zone, and flashes when the shot fires. It shows in combat and while Auto Shot or Shoot is on (or always, if you like), can be dragged anywhere once unlocked, or can sit on the game's bar. Each display follows the window style. Under Blizzard the straight designs sit in the swing timer's own frame, and the horseshoe arc, the ring and the reticle wear the swing timer bar's own art bent round the curve, taken live from the game. Under Dark and EllesmereUI they are a flat panel in the style's colors.
 
@@ -40,7 +42,7 @@ On the Alerts tab, all optional except the first two, and all work with or witho
 
 ## Options
 
-Esc > Options > AddOns > Shot Window, or type `/shotwindow`. The options have three tabs: Zone (the marks on the game's bar), Display and Alerts. If the game will not show the page (in combat, for example), the same options open in a window of their own.
+Esc > Options > AddOns > Shot Window, or type `/shotwindow`. The options show a live preview across the top and four tabs under it: Zone (the marks on the game's bar), Display, Alerts and Look. If the game will not show the page (in combat, for example), the same options open in a window of their own.
 
 - **Timing:** the aim window (0 to 1 second), starting earlier by your latency, an extra lead of 0 to 300 milliseconds, and keeping the zone lit until the shot fires. A line under them shows how long the red zone is right now.
 - **Red zone:** show or hide it, its color, its opacity, how bright it gets while you are inside it, and pulsing while it waits for a late shot.

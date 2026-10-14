@@ -9,11 +9,22 @@
 // parents and shows the canvas page), HideUIPanel(SettingsPanel) refused from addon code, and a
 // ColorPickerFrame that follows Forever's Mainline ColorPickerFrame.lua (SetColorRGB fires
 // swatchFunc before Show; any mouse-down outside it, and Escape, call cancelFunc). T.click,
-// T.drag, T.pickColor, T.pickerOkay, T.pickerCancel and T.escape stand in for the player.
+// T.drag, T.pickColor, T.pickerOkay, T.pickerCancel, T.escape and T.hover stand in for the player
+// (a disabled button takes no click, and no OnEnter unless its motion scripts run while disabled).
+//
+// The options' tabs and preview box: PanelTabButtonTemplate and InsetFrameTemplate follow
+// Blizzard_SharedXML/Mainline/SharedUIPanelTemplates.xml (the tab joins its parent's Tabs list,
+// lifts its frame level by 4 and resizes itself from the parent's min/maxTabWidth when shown), and
+// PanelTemplates_SetTab / UpdateTabs / SelectTab / DeselectTab / TabResize follow
+// SharedUIPanelTemplates.lua. A new frame sits one level above its parent. hooksecurefunc and
+// GetAppropriateTooltip are there as in the client. T.preview() is the options' preview (its
+// renderer, its mock game bar, its words), T.previewBox() the box round it, and T.unknownBut(list)
+// lists widget fields read that the stubs do not have.
 //
 //   node tests/shotwindowtest.js [--verbose]
 //   SHOTWINDOW_LUA=<path> node tests/shotwindowtest.js   (check another copy of the file)
 //   DISPLAYS_LUA=<path> node tests/shotwindowtest.js     (another copy of Displays.lua)
+//   SKINS_LUA=<path> node tests/shotwindowtest.js        (another copy of ShotWindow_Skins.lua)
 //
 // Window styles: Styles.lua and ShotWindow_Skins.lua load after ShotWindow.lua with the same
 // namespace, as the TOC lists them. A scenario can run Lua before the files load (its third
@@ -65,7 +76,8 @@ const ADDON_SOURCE = '@' + ADDON_FILE;
 // SHOTWINDOW_LUA=<file> runs the same checks against another copy (a candidate fix, say).
 const ADDON_SRC = fs.readFileSync(process.env.SHOTWINDOW_LUA || path.join(ROOT, ADDON_FILE), 'utf8');
 const STYLES_SRC = fs.readFileSync(path.join(ROOT, 'Styles.lua'), 'utf8');
-const SKINS_SRC = fs.readFileSync(path.join(ROOT, 'ShotWindow_Skins.lua'), 'utf8');
+// SKINS_LUA=<file> does the same for ShotWindow_Skins.lua.
+const SKINS_SRC = fs.readFileSync(process.env.SKINS_LUA || path.join(ROOT, 'ShotWindow_Skins.lua'), 'utf8');
 // DISPLAYS_LUA=<file> does the same for Displays.lua.
 const DISPLAYS_SRC = fs.readFileSync(process.env.DISPLAYS_LUA || path.join(ROOT, 'Displays.lua'), 'utf8');
 
@@ -343,7 +355,9 @@ T.moving = false
 function IsPlayerMoving() return T.moving == true end
 -- PlaySound(soundKitID, channel) records every call; SOUNDKIT has the ids of the kits the addon names.
 T.sounds = {}
-SOUNDKIT = { IG_MAINMENU_OPTION_CHECKBOX_ON = 856, MAP_PING = 3175, READY_CHECK = 8960, RAID_WARNING = 8959 }
+SOUNDKIT = { IG_MAINMENU_OPTION_CHECKBOX_ON = 856, MAP_PING = 3175, READY_CHECK = 8960, RAID_WARNING = 8959,
+  IG_CHARACTER_INFO_TAB = 841 }
+SWING_TIMER_RANGED = "Ranged" -- the game's name for the ranged swing bar (GlobalStrings)
 function PlaySound(id, channel)
   if realType(id) ~= "number" then error("PlaySound: bad argument #1 (number expected)", 2) end
   T.sounds[#T.sounds + 1] = { id = id, channel = channel }
@@ -591,7 +605,7 @@ end
 T.templates = { MinimalSliderTemplate = true, UISliderTemplate = true, OptionsSliderTemplate = true,
   UICheckButtonTemplate = true, ChatConfigCheckButtonTemplate = true, ColorSwatchTemplate = true,
   UIPanelButtonTemplate = true, ButtonFrameTemplate = true, BasicFrameTemplateWithInset = true,
-  UIPanelCloseButton = true }
+  UIPanelCloseButton = true, PanelTabButtonTemplate = true, InsetFrameTemplate = true }
 T.fonts = { GameFontNormal = true, GameFontNormalLarge = true, GameFontNormalSmall = true,
   GameFontHighlight = true, GameFontHighlightSmall = true, GameFontDisableSmall = true,
   GameFontNormalHuge = true, GameFontHighlightLarge = true }
@@ -764,6 +778,8 @@ function FS:SetJustifyV(j) self.justifyV = j end
 function FS:SetTextColor(r, g, b, a) self.textColor = { r, g, b, a } end
 function FS:SetFontObject(f) self.font = f end
 function FS:SetWordWrap(w) self.wrap = w end
+function FS:SetSpacing(px) self.spacing = px end
+function FS:IsTruncated() return false end
 
 local F = methods("Frame", "Region")
 function F:SetParent(p)
@@ -829,12 +845,23 @@ function F:CreateFontString(name, layer, template)
 end
 
 local B = methods("Button", "Frame")
-function B:SetText(t) self.text = t ~= nil and tostring(t) or nil end
+-- A button's text is its font string's (a template's ButtonText, or one given with SetFontString).
+function B:SetText(t)
+  self.text = t ~= nil and tostring(t) or nil
+  local fs = rawget(self, "fs")
+  if fs then fs:SetText(self.text) end
+end
 function B:GetText() return rawget(self, "text") end
 function B:RegisterForClicks(...) self.clicks = { ... } end
-function B:Enable() self.enabled = true end
-function B:Disable() self.enabled = false end
+function B:SetID(id) self.id = id end
+function B:GetID() return rawget(self, "id") or 0 end
+-- Enable and Disable send OnEnable / OnDisable when the state changes. A disabled button takes no
+-- clicks, and no OnEnter / OnLeave unless its motion scripts run while disabled (T.click, T.hover).
+function B:Enable() if rawget(self, "enabled") == false then self.enabled = true fireScript(self, "OnEnable") end end
+function B:Disable() if rawget(self, "enabled") ~= false then self.enabled = false fireScript(self, "OnDisable") end end
 function B:IsEnabled() return rawget(self, "enabled") ~= false end
+function B:SetMotionScriptsWhileDisabled(m) self.motionWhileDisabled = not not m end
+function B:GetMotionScriptsWhileDisabled() return rawget(self, "motionWhileDisabled") == true end
 function B:LockHighlight() self.highlightLocked = true end
 function B:UnlockHighlight() self.highlightLocked = false end
 function B:SetNormalFontObject(f) self.font = f end
@@ -1002,6 +1029,20 @@ function GameTooltip:SetText(text) self.lines = { text } end
 function GameTooltip:AddLine(text) self.lines[#self.lines + 1] = text end
 function GameTooltip:Show() self.shown = true end
 function GameTooltip:Hide() self.shown = false end
+function GameTooltip:IsOwned(f) return self.shown == true and self.owner == f end
+function GetAppropriateTooltip() return GameTooltip end -- in the game (the glue screens have their own)
+-- hooksecurefunc([table,] name, hook): the hook runs after the original, with the same arguments.
+function hooksecurefunc(a, b, c)
+  local t, name, hook = _G, a, b
+  if realType(a) == "table" then t, name, hook = a, b, c end
+  local orig = t[name]
+  if realType(orig) ~= "function" or realType(hook) ~= "function" then error("hooksecurefunc(): bad arguments", 2) end
+  t[name] = function(...)
+    local out = table.pack(orig(...))
+    hook(...)
+    return table.unpack(out, 1, out.n)
+  end
+end
 function T.tooltipHas(text)
   for _, l in ipairs(GameTooltip.lines) do if realType(l) == "string" and l:find(text, 1, true) then return true end end
   return false
@@ -1018,6 +1059,8 @@ local function newUI(kind, name, parent)
   if parent then
     f.parent = parent
     if rawget(parent, "children") then table.insert(parent.children, f) end
+    -- A new frame sits one level above its parent (a template can say otherwise: useParentLevel).
+    f.level = (rawget(parent, "level") or 0) + 1
   end
   f.vis = isVisible(f)
   return f
@@ -1149,6 +1192,163 @@ TEMPLATES.BasicFrameTemplateWithInset = function(f)
   f.Bg = bg
   f.CloseButton = closeButton(f, nil)
   f.TitleText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+end
+-- InsetFrameTemplate (Blizzard_SharedXML/Mainline/SharedUIPanelTemplates.xml:389): useParentLevel,
+-- layoutType "InsetFrameTemplate", Bg (BACKGROUND -5, the marble file, all points), and NineSlice,
+-- a child frame at the same level (useParentLevel over NineSlicePanelTemplate) whose OnLoad lays out
+-- NineSliceLayouts.InsetFrameTemplate: four corners and four edges, BORDER -5.
+TEMPLATES.InsetFrameTemplate = function(f)
+  local parent = rawget(f, "parent")
+  f.level = parent and rawget(parent, "level") or nil
+  f.layoutType = "InsetFrameTemplate"
+  local bg = f:CreateTexture(nil, "BACKGROUND", nil, -5)
+  bg:SetTexture("Interface\\FrameGeneral\\UI-Background-Marble")
+  bg:SetAllPoints()
+  f.Bg = bg
+  local nine = newUI("Frame", nil, f)
+  nine.level = rawget(f, "level")
+  nine:SetAllPoints()
+  for _, piece in ipairs({ { "TopLeftCorner", "UI-Frame-InnerTopLeft" }, { "TopRightCorner", "UI-Frame-InnerTopRight" },
+    { "BottomLeftCorner", "UI-Frame-InnerBotLeftCorner" }, { "BottomRightCorner", "UI-Frame-InnerBotRight" },
+    { "TopEdge", "_UI-Frame-InnerTopTile" }, { "BottomEdge", "_UI-Frame-InnerBotTile" },
+    { "LeftEdge", "!UI-Frame-InnerLeftTile" }, { "RightEdge", "!UI-Frame-InnerRightTile" } }) do
+    local t = nine:CreateTexture(nil, "BORDER", nil, -5)
+    t:SetAtlas(piece[2])
+    nine[piece[1]] = t
+  end
+  f.NineSlice = nine
+end
+-- PanelTabButtonTemplate (SharedUIPanelTemplates.xml:932, PanelTabButtonMixin in
+-- SharedUIPanelTemplates.lua:249): 10x32, motionScriptsWhileDisabled, parentArray="Tabs" (the tab
+-- joins its parent's Tabs list). BACKGROUND: LeftActive, RightActive, MiddleActive, Left, Right,
+-- Middle at their atlas sizes (UiTextureAtlasMember, 1.60.1.70009: uiframe-activetab-left 35x42,
+-- -right 37x42, uiframe-tab-left 35x36, -right 37x36, the centers tiled between); HIGHLIGHT: the
+-- same three at 0.4; Text, the button text (GameFontNormalSmall, CENTER 0, 2). OnLoad lifts the frame
+-- level by 4 and registers DISPLAY_SIZE_CHANGED; OnShow, and OnEvent while visible, run
+-- PanelTemplates_TabResize with the parent's tabPadding, minTabWidth and maxTabWidth.
+-- T.tabTemplateWithout = "<key>" leaves that piece out (a client whose template differs).
+TEMPLATES.PanelTabButtonTemplate = function(f)
+  f:SetSize(10, 32)
+  f:SetMotionScriptsWhileDisabled(true)
+  local parent = rawget(f, "parent")
+  if parent then
+    local list = rawget(parent, "Tabs") or {}
+    list[#list + 1] = f
+    rawset(parent, "Tabs", list)
+  end
+  f.TabTextures = {}
+  local function piece(key, layer, atlas, w, h, point, rel, relPoint, x)
+    if T.tabTemplateWithout == key then return end
+    local t = f:CreateTexture(nil, layer)
+    t:SetAtlas(atlas)
+    t:SetSize(w, h)
+    t:SetPoint(point, rel or f, relPoint or point, x or 0, 0)
+    if layer == "HIGHLIGHT" then t:SetAlpha(0.4) end
+    f[key] = t
+    f.TabTextures[#f.TabTextures + 1] = t
+  end
+  piece("LeftActive", "BACKGROUND", "uiframe-activetab-left", 35, 42, "TOPLEFT", nil, nil, -1)
+  piece("RightActive", "BACKGROUND", "uiframe-activetab-right", 37, 42, "TOPRIGHT", nil, nil, 8)
+  piece("MiddleActive", "BACKGROUND", "_uiframe-activetab-center", 1, 42, "TOPLEFT", rawget(f, "LeftActive"), "TOPRIGHT")
+  piece("Left", "BACKGROUND", "uiframe-tab-left", 35, 36, "TOPLEFT", nil, nil, -3)
+  piece("Right", "BACKGROUND", "uiframe-tab-right", 37, 36, "TOPRIGHT", nil, nil, 7)
+  piece("Middle", "BACKGROUND", "_uiframe-tab-center", 1, 36, "TOPLEFT", rawget(f, "Left"), "TOPRIGHT")
+  piece("LeftHighlight", "HIGHLIGHT", "uiframe-tab-left", 35, 36, "TOPLEFT", rawget(f, "Left"))
+  piece("MiddleHighlight", "HIGHLIGHT", "_uiframe-tab-center", 1, 36, "TOPLEFT", rawget(f, "Middle"))
+  piece("RightHighlight", "HIGHLIGHT", "uiframe-tab-right", 37, 36, "TOPRIGHT", rawget(f, "Right"))
+  if T.tabTemplateWithout ~= "Text" then
+    local text = f:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    text:SetSize(0, 10)
+    text:SetPoint("CENTER", f, "CENTER", 0, 2)
+    f.Text, f.fs = text, text
+  end
+  f.font, f.highlightFont, f.disabledFont = "GameFontNormalSmall", "GameFontHighlightSmall", "GameFontHighlightSmall"
+  local function resize(self)
+    local p = self:GetParent()
+    PanelTemplates_TabResize(self, p.tabPadding, nil, p.minTabWidth, p.maxTabWidth)
+  end
+  f.scripts.OnShow = resize
+  f.scripts.OnEvent = function(self) if self:IsVisible() then resize(self) end end
+  f.scripts.OnEnter = function(self) -- shows the label when it is cut short
+    local tooltip = GetAppropriateTooltip()
+    tooltip:Hide()
+    if self.Text:IsTruncated() then tooltip:SetOwner(self, "ANCHOR_RIGHT") tooltip:SetText(self.Text:GetText()) tooltip:Show() end
+  end
+  f.scripts.OnLeave = function() GetAppropriateTooltip():Hide() end
+  -- OnLoad
+  f:SetFrameLevel(f:GetFrameLevel() + 4)
+  f:RegisterEvent("DISPLAY_SIZE_CHANGED")
+end
+T.tabTemplateWithout = nil
+
+-- PanelTemplates (SharedUIPanelTemplates.lua:435-640). They are part of the client whether or not an
+-- addon uses the tab template. A frame's tabs are frame.Tabs[i], or the globals <name>Tab<i>.
+local function tabByIndex(frame, index) -- GetTabByIndex
+  return frame.Tabs and frame.Tabs[index] or _G[frame:GetName() .. "Tab" .. index]
+end
+function PanelTemplates_Tab_OnClick(self, frame) PanelTemplates_SetTab(frame, self:GetID()) end
+function PanelTemplates_SetTab(frame, id)
+  frame.selectedTab = id
+  PanelTemplates_UpdateTabs(frame)
+end
+function PanelTemplates_GetSelectedTab(frame) return frame.selectedTab end
+function PanelTemplates_UpdateTabs(frame)
+  if frame.selectedTab then
+    for i = 1, frame.numTabs, 1 do
+      local tab = tabByIndex(frame, i)
+      if tab.isDisabled then PanelTemplates_SetDisabledTabState(tab)
+      elseif i == frame.selectedTab then PanelTemplates_SelectTab(tab)
+      else PanelTemplates_DeselectTab(tab) end
+    end
+  end
+end
+local TAB_SIDES_PADDING = 20
+function PanelTemplates_TabResize(tab, padding, absoluteSize, minWidth, maxWidth, absoluteTextSize)
+  if absoluteTextSize then tab.Text:SetWidth(absoluteTextSize) else tab.Text:SetWidth(0) end
+  local textWidth = tab.Text:GetStringWidth()
+  local width = textWidth + TAB_SIDES_PADDING + (padding or 0)
+  local sideWidths = tab.Left:GetWidth() + tab.Right:GetWidth()
+  minWidth = minWidth or sideWidths
+  if absoluteSize then
+    if absoluteSize < sideWidths then width = sideWidths else width = absoluteSize end
+    textWidth = width - TAB_SIDES_PADDING - (padding or 0)
+  else
+    if maxWidth and width > maxWidth then
+      width = maxWidth
+      textWidth = width - TAB_SIDES_PADDING - (padding or 0)
+    elseif minWidth and width < minWidth then
+      width = minWidth
+      textWidth = width - TAB_SIDES_PADDING - (padding or 0)
+    end
+  end
+  tab.Text:SetWidth(textWidth)
+  tab:SetWidth(width)
+  T.tabResizes = (T.tabResizes or 0) + 1
+end
+function PanelTemplates_DeselectTab(tab)
+  tab.Left:Show() tab.Middle:Show() tab.Right:Show()
+  tab:Enable()
+  local offsetY = tab.deselectedTextY or 2
+  if tab.isTopTab then offsetY = -offsetY - 6 end
+  tab.Text:SetPoint("CENTER", tab, "CENTER", (tab.deselectedTextX or 0), offsetY)
+  tab.LeftActive:Hide() tab.MiddleActive:Hide() tab.RightActive:Hide()
+end
+function PanelTemplates_SelectTab(tab)
+  tab.Left:Hide() tab.Middle:Hide() tab.Right:Hide()
+  tab:Disable()
+  tab:SetDisabledFontObject(GameFontHighlightSmall)
+  local offsetY = tab.selectedTextY or -3
+  if tab.isTopTab then offsetY = -offsetY - 7 end
+  tab.Text:SetPoint("CENTER", tab, "CENTER", (tab.selectedTextX or 0), offsetY)
+  tab.LeftActive:Show() tab.MiddleActive:Show() tab.RightActive:Show()
+  local tooltip = GetAppropriateTooltip()
+  if tooltip:IsOwned(tab) then tooltip:Hide() end
+end
+function PanelTemplates_SetDisabledTabState(tab)
+  tab.Left:Show() tab.Middle:Show() tab.Right:Show()
+  tab:Disable()
+  tab:SetDisabledFontObject(GameFontDisableSmall)
+  tab.LeftActive:Hide() tab.MiddleActive:Hide() tab.RightActive:Hide()
 end
 
 function CreateFrame(kind, name, parent, template)
@@ -1331,6 +1531,10 @@ local function canTouch(f, what)
 end
 function T.click(f, button)
   if not canTouch(f, "T.click") then return end
+  if (f.kind == "Button" or f.kind == "CheckButton") and not f:IsEnabled() then
+    T.fails[#T.fails + 1] = "T.click: the button is disabled, so the click does nothing"
+    return
+  end
   T.mouseDown(f)
   if f.kind == "CheckButton" then f.checked = not f.checked end
   fireScript(f, "OnClick", button or "LeftButton", false)
@@ -1348,6 +1552,15 @@ function T.pickColor(r, g, b)
   T.mouseDown(T.picker.Content.ColorPicker)
   T.picker.Content.ColorPicker:SetColorRGB(r, g, b)
 end
+-- The mouse moves onto a control and off again: OnEnter, then OnLeave, as the client sends them (a
+-- disabled button only when its motion scripts run while disabled). Returns whether OnEnter went.
+function T.hover(f)
+  if not (f and f:IsVisible()) then return false end
+  if (f.kind == "Button" or f.kind == "CheckButton") and not f:IsEnabled() and not f:GetMotionScriptsWhileDisabled() then return false end
+  fireScript(f, "OnEnter")
+  return true
+end
+function T.unhover(f) fireScript(f, "OnLeave") end
 function T.pickerOkay() T.click(T.picker.Footer.OkayButton) end
 function T.pickerCancel() T.click(T.picker.Footer.CancelButton) end
 function T.escape()
@@ -1381,7 +1594,7 @@ local function hasText(f, text)
   for _, fs in ipairs(rawget(f, "fontStrings") or {}) do if rawget(fs, "text") == text then return true end end
   return false
 end
--- The controls sit on pages (Zone, Display, Alerts) inside the content; the content is the root.
+-- The controls sit on pages (Zone, Display, Alerts, Look) inside the content; the content is the root.
 function T.contents()
   local list = {}
   for _, f in ipairs(T.frames) do
@@ -1521,11 +1734,24 @@ function T.shownParts(r, design)
   for _, region in ipairs(r.parts[design or r.design] or {}) do if T.isShown(region) then n = n + 1 end end
   return n
 end
--- The preview boxes in the options (one on the Display page, one on the Alerts page).
-function T.preview(page)
-  for _, f in ipairs(T.frames) do
-    if rawget(f, "renderer") and isDescendant(f, page) then return f end
-  end
+-- The preview in the options: one for every tab, across the top of the controls (c.preview, in its
+-- box c.previewBox). It keeps the display's renderer (renderer), the mock game bar (bar), the
+-- call-out (say), the display's late readout (late) and the display's name (dispName).
+function T.preview(c)
+  c = c or T.content()
+  return c and rawget(c, "preview")
+end
+function T.previewBox(c)
+  c = c or T.content()
+  return c and rawget(c, "previewBox")
+end
+-- Widget fields read that the stubs do not have (T.unknown), except those in allowed: a sorted list.
+function T.unknownBut(allowed)
+  local ok, out = {}, {}
+  for _, k in ipairs(allowed or {}) do ok[k] = true end
+  for k, n in pairs(T.unknown) do if not ok[k] then out[#out + 1] = k .. " x" .. n end end
+  table.sort(out)
+  return out
 end
 -- The player drags a frame: only one that takes the mouse and is registered for dragging gets it.
 function T.dragFrame(f, dx, dy)
@@ -2178,8 +2404,11 @@ scenario('options: switching category and back; a small canvas scales the contro
   T.closePanel()
   T.canvas:SetSize(500, 400)
   T.slash("")
-  local want = math.min(1, 488 / 600, (400 - 10 - 8) / 562) -- tabs share the title line
+  local want = math.min(1, 488 / 600, (400 - 10 - 8) / 581) -- the preview takes the title's place
   check(near(c:GetScale(), want), "scaled to fit (" .. tostring(c:GetScale()) .. ", want " .. want .. ")")
+  local p = c.points[1]
+  check(p and p[1] == "TOPLEFT" and p[2] == page and near(p[4] * want, 6) and near(p[5] * want, -10),
+    "placed 6 in and 10 down in the page's units (offsets " .. tostring(p and p[4]) .. ", " .. tostring(p and p[5]) .. " at scale " .. want .. ")")
   T.update(0.016)
   check(near(c:GetScale(), want) and c:IsVisible(), "refit on OnSizeChanged")
   check(#T.errors == 0, "no errors")
@@ -3092,16 +3321,16 @@ scenario('options: labels click too (hit rects), swatches sit under the checkbox
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: every control on every page fits above the Defaults row (CONTENT_H 562)', String.raw`
+scenario('options: every control on every page fits above the Defaults row (CONTENT_H 581)', String.raw`
   T.login(200)
   T.slash("")
   local c = T.content()
-  check(c.height == 562, "content 562 high (" .. tostring(c.height) .. ")")
+  check(c.height == 581, "content 581 high (" .. tostring(c.height) .. ")")
   local reset = T.button("Defaults")
   local rp = reset.points[1]
   local resetTop = -(c.height - rp[3] - reset.height)
   local lowest, what = 0, nil
-  check(#T.pages() == 3, "three pages")
+  check(#T.pages() == 4, "four pages")
   for _, page in ipairs(T.pages()) do
     local top = page.points[1][3]
     for _, f in ipairs(page.children) do
@@ -3344,6 +3573,9 @@ scenario('styles: Blizzard to Dark from the Look button draws at once; opacity l
   check(w and shared:GetParent() == w and #T.contents() == 1, "Blizzard: the shared controls in the window")
   check(not w.swSkinned, "window not drawn on")
   local before = #w.textures
+  check(not T.button("Window style: Automatic"):IsVisible(), "the style button is on the Look tab, not the Zone tab")
+  T.click(T.tab(4))
+  check(T.tab(4).text == "Look" and T.pages()[4]:IsVisible() and T.button("Window style: Automatic"):IsVisible(), "the Look tab shows it")
   T.click(T.button("Window style: Automatic"), "RightButton")
   check(ShotWindowDB.style == "dark", "right-click steps back to Dark (" .. tostring(ShotWindowDB.style) .. ")")
   check(NS.report.skin == "Dark", "Dark drawn at once (" .. tostring(NS.report.skin) .. ")")
@@ -4372,34 +4604,68 @@ scenario('display: /shotwindow display <name>, display alone steps on, unknown n
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: three tabs, Zone first; a tab shows its page, the mark and highlight follow; the tab is kept on reopening', DISPLAY_HELPERS + String.raw`
+// The tab scenario on both paths: the game's tab template (selection through PanelTemplates: the
+// selected tab disabled, its Active pieces shown) and plain tabs (selected flag and colors).
+for (const [mode, label, pre] of [['template', 'the game\'s tab template', ''], ['plain', 'plain tabs', 'T.templates.PanelTabButtonTemplate = nil\n']]) {
+  scenario('options: four tabs, Zone first; a tab shows its page and only its page, the selection follows (' + label + '); the tab is kept on reopening', DISPLAY_HELPERS + 'local MODE = "' + mode + '"\n' + pre + String.raw`
   T.login(200)
   T.slash("")
-  local pages = T.pages()
-  check(#pages == 3 and T.tab(1).text == "Zone" and T.tab(2).text == "Display" and T.tab(3).text == "Alerts", "Zone, Display, Alerts")
-  local function on(i)
-    for k = 1, 3 do
-      if pages[k]:IsShown() ~= (k == i) then return false end
-      if T.tab(k).swMark:IsShown() ~= (k == i) then return false end
-      if rawget(T.tab(k), "highlightLocked") ~= (k == i) then return false end
+  local c, pages = T.content(), T.pages()
+  check(#pages == 4 and #c.tabs == 4 and T.tab(1).text == "Zone" and T.tab(2).text == "Display" and T.tab(3).text == "Alerts" and T.tab(4).text == "Look",
+    "Zone, Display, Alerts, Look")
+  check(c.tabStyle == (MODE == "template" and "PanelTabButtonTemplate" or "plain"), "tab style (" .. tostring(c.tabStyle) .. ")")
+  -- What the player sees as the selected tab, and as one of the others.
+  local function looksSelected(tab)
+    if MODE == "template" then
+      return not tab:IsEnabled() and not tab.Left:IsShown() and not tab.Middle:IsShown() and not tab.Right:IsShown()
+        and tab.LeftActive:IsShown() and tab.MiddleActive:IsShown() and tab.RightActive:IsShown()
     end
-    return pages[i]:IsVisible()
+    local bg = tab.swBg.colorTex
+    return tab.selected == true and tab:IsEnabled() and close(bg[1], 0.35, 1e-9) and close(bg[2], 0.28, 1e-9) and close(bg[3], 0.12, 1e-9)
   end
-  check(on(1), "Zone first")
+  local function looksDeselected(tab)
+    if MODE == "template" then
+      return tab:IsEnabled() and tab.Left:IsShown() and tab.Middle:IsShown() and tab.Right:IsShown()
+        and not tab.LeftActive:IsShown() and not tab.MiddleActive:IsShown() and not tab.RightActive:IsShown()
+    end
+    local bg = tab.swBg.colorTex
+    return tab.selected == false and tab:IsEnabled() and close(bg[1], 0.12, 1e-9) and close(bg[2], 0.1, 1e-9) and close(bg[3], 0.07, 1e-9)
+  end
+  local function on(i, what)
+    local bad = {}
+    for k = 1, 4 do
+      if pages[k]:IsShown() ~= (k == i) then bad[#bad + 1] = "page " .. k .. (k == i and " hidden" or " shown") end
+      if k == i and not looksSelected(T.tab(k)) then bad[#bad + 1] = "tab " .. k .. " not drawn selected" end
+      if k ~= i and not looksDeselected(T.tab(k)) then bad[#bad + 1] = "tab " .. k .. " not drawn deselected" end
+    end
+    if MODE == "template" and c.tabStrip.selectedTab ~= i then bad[#bad + 1] = "the strip's selectedTab is " .. tostring(c.tabStrip.selectedTab) end
+    if c.swTab ~= i then bad[#bad + 1] = "c.swTab " .. tostring(c.swTab) end
+    if not pages[i]:IsVisible() then bad[#bad + 1] = "its page not visible" end
+    check(#bad == 0, what .. (#bad > 0 and (": " .. table.concat(bad, ", ")) or ""))
+  end
+  on(1, "Zone first")
   check(T.checkbox("Show the red zone"):IsVisible() and not T.checkbox("Lock in place"):IsVisible(), "only the Zone page's controls")
   T.click(T.tab(2))
-  check(on(2), "Display: its page, the mark under its tab")
+  on(2, "Display: its page, its tab selected")
   check(T.checkbox("Lock in place"):IsVisible() and not T.checkbox("Show the red zone"):IsVisible(), "only the Display page's controls")
   T.click(T.tab(3))
-  check(on(3) and T.checkbox("Say Stop, Moving, Late and Go"):IsVisible(), "Alerts")
+  on(3, "Alerts")
+  check(T.checkbox("Say Stop, Moving, Late and Go"):IsVisible() and not T.checkbox("Lock in place"):IsVisible(), "only the Alerts page's controls")
+  T.click(T.tab(4))
+  on(4, "Look")
+  check(T.button("Window style: Automatic"):IsVisible() and not T.checkbox("Say Stop, Moving, Late and Go"):IsVisible(), "only the Look page's controls")
   T.closePanel()
   T.slash("")
-  check(on(3), "reopened on the Alerts page")
+  on(4, "reopened on the Look page")
+  T.click(T.tab(3))
+  on(3, "then Alerts")
   T.click(T.tab(1))
-  check(on(1), "back to Zone")
-  check(T.button("Defaults"):IsVisible(), "Defaults under every page")
+  on(1, "back to Zone")
+  check(T.button("Defaults"):IsVisible() and T.previewBox():IsVisible(), "the preview above and Defaults under every page")
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks (" .. table.concat(T.unknownBut(), ", ") .. ")")
   check(#T.errors == 0, "no errors")
 `);
+}
 
 for (const [mode, label] of [['lines', 'Line regions'], ['squares', 'no CreateLine']]) {
   scenario('options: the Design button steps through every design, right click back; the preview draws each without errors (' + label + ')', DISPLAY_HELPERS + 'T.noLines = ' + (mode === 'squares') + '\n' + String.raw`
@@ -4409,10 +4675,11 @@ for (const [mode, label] of [['lines', 'Line regions'], ['squares', 'no CreateLi
     T.click(T.tab(2))
     local db = ShotWindowDB
     local page = T.pages()[2]
-    local box = T.preview(page)
-    check(box ~= nil and box:IsVisible() and box.width == 270 and box.height == 150, "a 270x150 preview on the Display page")
-    local r = box.renderer
-    local lateFS = box.children[1].fontStrings[2]
+    local stage, box = T.preview(), T.previewBox()
+    check(stage ~= nil and box ~= nil and box:IsVisible() and box.width == 584 and box.height == 132 and stage.width == 584 and stage.height == 132,
+      "the 584x132 preview over the tabs, shown on the Display tab")
+    local r, g = stage.renderer, stage.bar
+    local lateFS = stage.late
     local design = buttonStarting("Design: ")
     check(design and design.text == "Design: None (marks on the game's bar only)", "the Design button names the choice (" .. tostring(design and design.text) .. ")")
     check(textOn(page, NS.DISPLAY_NOTES.none) ~= nil, "the note under it")
@@ -4422,21 +4689,33 @@ for (const [mode, label] of [['lines', 'Line regions'], ['squares', 'no CreateLi
       T.click(design)
       check(db.display == want and design.text == "Design: " .. NS.DISPLAY_NAMES[want], "left click: " .. want .. " (" .. tostring(db.display) .. ")")
       check(textOn(page, NS.DISPLAY_NOTES[want]) ~= nil, want .. ": its note")
-      local errs, drawn, late = #T.errors, 0, false
+      -- The game's bar is drawn on every frame; a design is drawn beside it, none hides the display's
+      -- cell. The made-up late shot's delay shows under the display, or on the bar with none.
+      local errs, drawn, late, barLate, cellShown = #T.errors, 0, false, false, 0
       for k = 1, 37 do
         T.now = T.now + 0.25 T.update()
-        if T.shownParts(r) > 0 then drawn = drawn + 1 end
+        local bar = T.isShown(g.stand) and g.frame:IsVisible()
+        if want == "none" then
+          if bar then drawn = drawn + 1 end
+        elseif bar and T.shownParts(r) > 0 and r.frame:IsVisible() then drawn = drawn + 1 end
+        if r.frame:IsVisible() then cellShown = cellShown + 1 end
         if lateFS:IsShown() and lateFS.text == "+0.60" then late = true end
+        if g.late:IsShown() and g.late.text == "+0.60" then barLate = true end
       end
-      local d = want == "none" and "classic" or want
-      local w, h = NS.DisplaySize(db, d)
-      if want == "none" then w, h = 200, 14 end
       check(#T.errors == errs, want .. ": the preview runs without errors (" .. (#T.errors - errs) .. ")")
-      check(r.design == d and r.w == w and r.h == h, want .. ": the preview draws " .. d .. " at " .. w .. "x" .. h .. " (" .. tostring(r.design) .. " " .. tostring(r.w) .. "x" .. tostring(r.h) .. ")")
-      local fit = math.min(1, 250 / w, 100 / h)
-      check(close(r.frame:GetScale(), fit, 0.002), want .. ": scaled to fit the box (" .. num(r.frame:GetScale()) .. ", want " .. num(fit) .. ")")
       check(drawn == 37, want .. ": drawn on every frame (" .. drawn .. ")")
-      check(late, want .. ": the made-up late shot's delay shows")
+      if want == "none" then
+        check(cellShown == 0, want .. ": no display drawn in the preview (" .. cellShown .. " frames)")
+        check(barLate and not late, want .. ": the made-up late shot's delay on the game's bar")
+        check(stage.dispName.text == "No display of its own", want .. ": named (" .. tostring(stage.dispName.text) .. ")")
+      else
+        local w, h = NS.DisplaySize(db, want)
+        check(r.design == want and r.w == w and r.h == h, want .. ": the preview draws " .. want .. " at " .. w .. "x" .. h .. " (" .. tostring(r.design) .. " " .. tostring(r.w) .. "x" .. tostring(r.h) .. ")")
+        local fit = math.min(1, (292 - 24) / w, (132 - 18 - 22 - 14) / h) -- its half of the width, the height under the names and the call-out
+        check(close(r.frame:GetScale(), fit, 0.002), want .. ": scaled to fit its cell (" .. num(r.frame:GetScale()) .. ", want " .. num(fit) .. ")")
+        check(late and not barLate, want .. ": the made-up late shot's delay under the display, not on the bar")
+        check(stage.dispName.text == "Display: " .. NS.DISPLAY_NAMES[want], want .. ": named (" .. tostring(stage.dispName.text) .. ")")
+      end
       if want ~= "none" then
         check(ShotWindowDisplay and ShotWindowDisplay:IsShown() and T.rend().design == want, want .. ": the display itself follows")
       end
@@ -4467,7 +4746,9 @@ scenario('options: the Display page grays out what the chosen design does not us
       ["Size of a round design"] = u(round), ["Line thickness of a round design"] = u(round),
       ["Rhythm track: seconds shown"] = u(d == "track"), ["Pips: how many"] = u(d == "pips"),
       ["Lock in place"] = u(d ~= "none"), ["Sit on the game's swing bar"] = u(d ~= "none"), ["Show out of combat too"] = u(d ~= "none"),
-      ["Move color"] = "usable", ["Use the window style's accent for move"] = "usable",
+      -- Blizzard has no accent to use, so its checkbox is grayed (the Dark scenario below has it usable).
+      ["Move color"] = "usable", ["Use the window style's accent for move"] = "grayed",
+      ["Words: Move, Stand still, Moving, Late"] = u(d == "arc" or d == "ring"), ["Show the ring's countdown"] = u(d == "ring"),
     })
     check(grayOf("Scanner: out and back") == u(d == "scanner"), d .. ": the Scanner button " .. u(d == "scanner") .. " (" .. grayOf("Scanner: out and back") .. ")")
     check(grayOf("Reset position") == u(d ~= "none"), d .. ": Reset position " .. u(d ~= "none") .. " (" .. grayOf("Reset position") .. ")")
@@ -4562,11 +4843,27 @@ scenario('options: the Alerts page controls change the settings and gray out wit
   check(edge:IsShown() and close(top.height, 150) and g and sameRGB({ g[3].r, g[3].g, g[3].b }, db.clipColor), "in a fight: the edge 150 px in the picked clip color")
   check(ShotWindowCallout:IsShown() and fs.text == "Moving" and sameRGB(fs.textColor, db.clipColor), "Moving in the picked clip color")
   check(#T.sounds == n + 4 and T.sounds[#T.sounds].id == SOUNDKIT.RAID_WARNING, "the zone's sound in the chosen kit (" .. (#T.sounds - n) .. " since)")
-  local box = T.preview(T.pages()[3])
-  check(box and box:IsVisible() and box.renderer ~= T.preview(T.pages()[2]).renderer, "a preview of its own on the Alerts page")
-  local errs = #T.errors
-  for k = 1, 37 do T.now = T.now + 0.25 T.update() end
-  check(#T.errors == errs and T.shownParts(box.renderer) > 0, "it runs")
+  -- The one preview stays over the Alerts tab and shows these alerts: the call-out (at most 20 pt)
+  -- and the screen edge in miniature (12 px), in the picked clip color while moving.
+  local stage = T.preview()
+  check(stage and stage:IsVisible() and T.pages()[3]:IsVisible() and T.previewBox():IsVisible(), "the preview over the Alerts tab")
+  local errs, said, clipEdge, sizes = #T.errors, {}, 0, {}
+  for k = 1, 37 do
+    T.now = T.now + 0.25 T.update()
+    if stage.say:IsShown() then said[stage.say.text] = true sizes[#sizes + 1] = stage.say.fontSize end
+    for i = 1, 4 do
+      local band = stage.textures[i]
+      local bg = rawget(band, "gradient")
+      if band.shown and bg and sameRGB({ bg[2].r, bg[2].g, bg[2].b }, db.clipColor)
+        and close(i <= 2 and band.height or band.width, 12, 1e-9) then clipEdge = clipEdge + 1 end
+    end
+  end
+  check(#T.errors == errs, "it runs without errors (" .. (#T.errors - errs) .. ")")
+  check(said.Stop and said.Moving and said.Late, "its call-out says Stop, Moving and Late")
+  local big = 0
+  for _, s in ipairs(sizes) do if s ~= 20 then big = big + 1 end end
+  check(#sizes > 0 and big == 0, "the call-out at 20 pt in the preview while set to 40 (" .. big .. " frames otherwise)")
+  check(clipEdge >= 4, "its screen edge, 12 px, in the picked clip color while moving (" .. clipEdge .. " band frames)")
   check(#T.errors == 0, "no errors")
 `);
 
@@ -4577,7 +4874,8 @@ scenario('options: Defaults puts every display and alert setting back and hides 
   local db = ShotWindowDB
   local changed = { display = "ring", warnMove = false, lateText = false, callout = true, calloutSize = 40, edge = true, edgeSize = 150,
     sound = true, soundKit = 3, moveAccent = false, dispWidth = 300, dispHeight = 20, dispSize = 200, dispThick = 20,
-    artFlip = true, dispLocked = false, dispAlways = true, dispOnBar = false, scanMode = "wrap", trackSeconds = 8, pipCount = 15 }
+    artFlip = true, dispLocked = false, dispAlways = true, dispOnBar = false, scanMode = "wrap", trackSeconds = 8, pipCount = 15,
+    dispWords = false, dispCount = false }
   for k, v in pairs(changed) do db[k] = v end
   db.clipColor[1], db.moveColor[2] = 0, 0
   T.slash("display ring")
@@ -4587,7 +4885,8 @@ scenario('options: Defaults puts every display and alert setting back and hides 
   T.click(T.button("Defaults"))
   local want = { display = "none", warnMove = true, lateText = true, callout = false, calloutSize = 26, edge = false, edgeSize = 90,
     sound = false, soundKit = 1, moveAccent = true, dispWidth = 240, dispHeight = 16, dispSize = 140, dispThick = 12,
-    artFlip = false, dispLocked = true, dispAlways = false, dispOnBar = false, scanMode = "pingpong", trackSeconds = 5, pipCount = 11 }
+    artFlip = false, dispLocked = true, dispAlways = false, dispOnBar = false, scanMode = "pingpong", trackSeconds = 5, pipCount = 11,
+    dispWords = true, dispCount = true }
   local bad = {}
   for k, v in pairs(want) do if db[k] ~= v then bad[#bad + 1] = k .. "=" .. tostring(db[k]) end end
   table.sort(bad)
@@ -4600,6 +4899,837 @@ scenario('options: Defaults puts every display and alert setting back and hides 
   check(buttonStarting("Design: ").text == "Design: None (marks on the game's bar only)", "the Design button says None")
   check(#T.errors == 0, "no errors")
 `);
+
+// ---------------------------------------------------------------------------------------------
+// The options layout: the preview across the top, four tabs hanging under it (the game's tab
+// template, or plain ones), the open tab's page, the Defaults row.
+
+const TAB_HELPERS = String.raw`
+  local W, PREVIEW_H, TAB_H, TAB_W, TAB_X, TAB_GAP, TAB_TUCK = 600, 132, 32, 120, 8, 3, 1
+  local BOX_X, BOX_W = 8, 600 - 16 -- the preview box: inside the window's inset (4 to 594) too
+  local PAGE_TOP, PAGE_H, CONTENT_H = 169, 384, 581
+  local LABELS = { "Zone", "Display", "Alerts", "Look" }
+  local TIPS = {
+    "The stand-still zone on the game's swing bar: its timing, the red zone, the marker line and the fill.",
+    "A display of its own besides the game's bar: the design, where it sits and its size.",
+    "Moving in the zone, late shots, call-out text, the screen edge and a sound.",
+    "The window style: Blizzard, Dark or EllesmereUI, for this window, the swing bars and the displays.",
+  }
+  -- Each tab's box in the content's units, x right and y down from its top left, worked out from the
+  -- anchors: the strip TOPLEFT on the preview box's BOTTOMLEFT, tab 1 TOPLEFT on the strip's, each
+  -- next one LEFT on the last one's RIGHT. nil when a tab is anchored any other way.
+  local function tabBoxes(c)
+    local box, strip = c.previewBox, c.tabStrip
+    local bp, sp = box.points[1], strip.points[1]
+    if not (#box.points == 1 and bp[1] == "TOPLEFT" and type(bp[2]) == "number" and type(bp[3]) == "number"
+      and #strip.points == 1 and sp[1] == "TOPLEFT" and sp[2] == box and sp[3] == "BOTTOMLEFT") then return nil end
+    local sx, sy = bp[2] + sp[4], -bp[3] + box.height - sp[5]
+    local out = {}
+    for i, tab in ipairs(c.tabs) do
+      local p = tab.points[1]
+      if #tab.points ~= 1 then return nil end
+      if i == 1 then
+        if not (p[1] == "TOPLEFT" and p[2] == strip and p[3] == "TOPLEFT") then return nil end
+        out[i] = { x0 = sx + p[4], y0 = sy - p[5], x1 = sx + p[4] + tab.width, y1 = sy - p[5] + tab.height }
+      else
+        if not (p[1] == "LEFT" and p[2] == c.tabs[i - 1] and p[3] == "RIGHT") then return nil end
+        local prev = out[i - 1]
+        local mid = (prev.y0 + prev.y1) / 2 - p[5]
+        out[i] = { x0 = prev.x1 + p[4], y0 = mid - tab.height / 2, x1 = prev.x1 + p[4] + tab.width, y1 = mid + tab.height / 2 }
+      end
+    end
+    return out
+  end
+  -- What is wrong with the frame levels: with the template the selected tab is above the others;
+  -- on both paths the preview box's border (its NineSlice) is above every tab.
+  local function levelProblems(c, sel, template)
+    local bad, top = {}, 0
+    local selected = c.tabs[sel]:GetFrameLevel()
+    for i, tab in ipairs(c.tabs) do
+      local l = tab:GetFrameLevel()
+      top = math.max(top, l)
+      if template and i ~= sel and l >= selected then bad[#bad + 1] = "tab " .. i .. " at level " .. l .. ", not under the selected tab's " .. selected end
+    end
+    local nine = c.previewBox.NineSlice
+    if nine:GetFrameLevel() <= top then bad[#bad + 1] = "the preview box's border at level " .. nine:GetFrameLevel() .. ", not above the top tab's " .. top end
+    return bad
+  end
+  local function joined(list) return #list > 0 and (": " .. table.concat(list, "; ")) or "" end
+`;
+
+const PREVIEW_HELPERS = String.raw`
+  local SW = 230 -- the mock bar's status area: 240 less 5 on each side
+  local P0
+  -- The preview's made-up loop starts at its first frame: startLoop() runs that frame now; at(t)
+  -- runs the frame t seconds into the loop (9 s with a 2.8 s weapon: three swings and 0.6 s late).
+  local function startLoop() P0 = T.now T.update() end
+  local function at(t) T.now = P0 + t T.update() end
+  local function colorIs(t, c, a)
+    local got = rawget(t, "colorTex")
+    return type(got) == "table" and close(got[1], c[1], 1e-6) and close(got[2], c[2], 1e-6) and close(got[3], c[3], 1e-6)
+      and (a == nil or close(got[4], a, 1e-6))
+  end
+  local function colorStr(t)
+    local c = rawget(t, "colorTex")
+    return c and string.format("%.2f,%.2f,%.2f,%.2f", c[1], c[2], c[3], c[4]) or "none"
+  end
+  -- The band on the mock bar: its left edge and width, or nil when hidden. Both anchors sit on the
+  -- status area at that x, one at its top and one at its bottom, so it spans the full height.
+  local function bandOf(g)
+    local t = g.stand
+    if not T.isShown(t) then return nil end
+    local a, b = t.points[1], t.points[2]
+    if #t.points ~= 2 or a[1] ~= "TOPLEFT" or a[2] ~= g.sb or a[3] ~= "TOPLEFT" or a[5] ~= 0
+      or b[1] ~= "BOTTOMLEFT" or b[2] ~= g.sb or b[3] ~= "BOTTOMLEFT" or b[5] ~= 0 or a[4] ~= b[4] then return "bad anchors" end
+    return a[4], t.width
+  end
+  -- The marker line's x, from its TOP on the status area's top to its BOTTOM on its bottom.
+  local function lineOf(g)
+    local t = g.line
+    if not T.isShown(t) then return nil end
+    local a, b = t.points[1], t.points[2]
+    if #t.points ~= 2 or a[1] ~= "TOP" or a[2] ~= g.sb or a[3] ~= "TOPLEFT" or a[5] ~= 0
+      or b[1] ~= "BOTTOM" or b[2] ~= g.sb or b[3] ~= "BOTTOMLEFT" or b[5] ~= 0 or a[4] ~= b[4] then return "bad anchors" end
+    return a[4]
+  end
+  -- Where a frame's center lands on the frame it is anchored to (x right, y up from its top left).
+  -- The client reads an anchor's offsets in the anchored frame's own scaled units, so a frame scaled
+  -- by s and placed at (x, y) lands at (x * s, y * s); Host in ShotWindow.lua divides its offsets by
+  -- the scale for that reason.
+  local function landsAt(f, rel)
+    local p = f.points[1]
+    if #f.points ~= 1 or p[1] ~= "CENTER" then return nil end
+    local s = f:GetScale() or 1
+    if p[2] == rel and p[3] == "TOPLEFT" then return p[4] * s, p[5] * s end
+    -- CENTER on another frame's CENTER: where that one lands, plus this one's own offsets at its scale.
+    if p[3] == "CENTER" and type(p[2]) == "table" and p[2] ~= rel then
+      local x, y = landsAt(p[2], rel)
+      if x then return x + (p[4] or 0) * s, y + (p[5] or 0) * s end
+    end
+    return nil
+  end
+`;
+
+scenario('options tabs (the game\'s tab template): four tabs hang from the preview box, 3 apart and 120 wide (also after OnShow); a click selects through PanelTemplates and plays the tab sound; only its page shows; the selected tab above its neighbours, the box\'s border above every tab; kept on reopening; tooltips', DISPLAY_HELPERS + TAB_HELPERS + String.raw`
+  local setTabs = {}
+  local setTab = PanelTemplates_SetTab
+  PanelTemplates_SetTab = function(frame, id) setTabs[#setTabs + 1] = { frame = frame, id = id } return setTab(frame, id) end
+  T.login(200)
+  T.slash("")
+  local c, box = T.content(), T.previewBox()
+  local strip, tabs, pages = c.tabStrip, c.tabs, T.pages()
+  check(c.tabStyle == "PanelTabButtonTemplate" and #tabs == 4, "four tabs in the game's tab template (" .. tostring(c.tabStyle) .. ")")
+  check(box.template == "InsetFrameTemplate" and box.width == BOX_W and box.height == PREVIEW_H, "the preview in the game's inset box, " .. BOX_W .. "x" .. PREVIEW_H)
+  local listed = rawget(strip, "Tabs") or {}
+  local inOrder = #listed == 4
+  for i = 1, 4 do inOrder = inOrder and listed[i] == tabs[i] end
+  check(inOrder and strip.numTabs == 4, "every tab in the strip's Tabs list (the template's parentArray), in order, and numTabs 4")
+  check(strip.minTabWidth == TAB_W and strip.maxTabWidth == TAB_W, "the strip tells the template its tabs are 120 wide")
+  local sp = strip.points[1]
+  check(#strip.points == 1 and sp[1] == "TOPLEFT" and sp[2] == box and sp[3] == "BOTTOMLEFT" and sp[4] == 0 and sp[5] == TAB_TUCK,
+    "the strip hangs from the preview box's bottom left, 1 up")
+  local function placed(what)
+    local boxes = tabBoxes(c)
+    check(boxes ~= nil, what .. ": tab 1 at the strip's top left, each next one LEFT on the last one's RIGHT")
+    for i, tab in ipairs(tabs) do
+      check(tab.width == TAB_W and tab.height == TAB_H and tab.Text.width == TAB_W - 20,
+        what .. ": tab " .. i .. " 120 wide (its label 100), 32 tall (" .. tostring(tab.width) .. "x" .. tostring(tab.height) .. ", label " .. tostring(tab.Text.width) .. ")")
+      local b = boxes and boxes[i]
+      if b then
+        local x = BOX_X + TAB_X + (i - 1) * (TAB_W + TAB_GAP)
+        check(close(b.x0, x, 1e-9), what .. ": tab " .. i .. " starts at " .. x .. ", 3 after the last (" .. num(b.x0) .. ")")
+        check(close(b.y0, PREVIEW_H - TAB_TUCK, 1e-9) and close(b.y1, PREVIEW_H - TAB_TUCK + TAB_H, 1e-9),
+          what .. ": tab " .. i .. " top 1 up under the box's bottom edge, level with the others (" .. num(b.y0) .. " to " .. num(b.y1) .. ")")
+        check(b.y1 <= PAGE_TOP and b.x1 <= BOX_X + BOX_W, what .. ": tab " .. i .. " above the pages and within the box's width")
+      end
+    end
+  end
+  placed("built")
+  for i, tab in ipairs(tabs) do
+    check(tab:GetParent() == strip and tab.template == "PanelTabButtonTemplate" and tab.text == LABELS[i] and tab.Text.text == LABELS[i] and tab:GetID() == i,
+      "tab " .. i .. ": " .. LABELS[i] .. " on its label, ID " .. i .. " (" .. tostring(tab.Text.text) .. ", " .. tostring(tab:GetID()) .. ")")
+  end
+  -- The template sizes a tab from the strip's minTabWidth and maxTabWidth whenever it is shown, and
+  -- on a display size change.
+  local n = T.tabResizes or 0
+  check(n >= 8, "the template's OnShow resized the shown tabs (" .. n .. " resizes)")
+  T.fire("DISPLAY_SIZE_CHANGED")
+  check((T.tabResizes or 0) >= n + 4, "and again on DISPLAY_SIZE_CHANGED")
+  placed("after OnShow and a display size change")
+
+  local function selected(i, what)
+    local bad = {}
+    if strip.selectedTab ~= i then bad[#bad + 1] = "the strip's selectedTab is " .. tostring(strip.selectedTab) end
+    for k, tab in ipairs(tabs) do
+      local on = k == i
+      if tab:IsEnabled() == on then bad[#bad + 1] = "tab " .. k .. (on and " enabled" or " disabled") end
+      if tab.LeftActive:IsShown() ~= on or tab.MiddleActive:IsShown() ~= on or tab.RightActive:IsShown() ~= on then bad[#bad + 1] = "tab " .. k .. " active art " .. (on and "hidden" or "shown") end
+      if tab.Left:IsShown() == on or tab.Middle:IsShown() == on or tab.Right:IsShown() == on then bad[#bad + 1] = "tab " .. k .. " plain art " .. (on and "shown" or "hidden") end
+      if pages[k]:IsShown() ~= on then bad[#bad + 1] = "page " .. k .. (on and " hidden" or " shown") end
+    end
+    for _, b in ipairs(levelProblems(c, i, true)) do bad[#bad + 1] = b end
+    check(#bad == 0, what .. joined(bad))
+  end
+  selected(1, "Zone first: selected through the template")
+  check(#setTabs >= 1 and setTabs[#setTabs].frame == strip and setTabs[#setTabs].id == 1, "through PanelTemplates_SetTab(strip, 1)")
+  check(T.checkbox("Show the red zone"):IsVisible() and not T.checkbox("Lock in place"):IsVisible(), "only the Zone page's controls")
+  for _, i in ipairs({ 2, 3, 4, 1, 3 }) do
+    local sounds, calls = #T.sounds, #setTabs
+    T.click(tabs[i])
+    check(#T.sounds == sounds + 1 and T.sounds[#T.sounds].id == SOUNDKIT.IG_CHARACTER_INFO_TAB and SOUNDKIT.IG_CHARACTER_INFO_TAB == 841,
+      LABELS[i] .. ": the tab sound, IG_CHARACTER_INFO_TAB (" .. tostring(T.sounds[#T.sounds] and T.sounds[#T.sounds].id) .. ")")
+    check(#setTabs == calls + 1 and setTabs[#setTabs].frame == strip and setTabs[#setTabs].id == i, LABELS[i] .. ": PanelTemplates_SetTab(strip, " .. i .. ")")
+    selected(i, LABELS[i] .. ": its tab selected and drawn so, only its page, the levels")
+    check(pages[i]:IsVisible() and c.swTab == i, LABELS[i] .. ": its page on view")
+  end
+  check(T.checkbox("Say Stop, Moving, Late and Go"):IsVisible() and not T.checkbox("Show the red zone"):IsVisible(), "only the Alerts page's controls")
+  T.closePanel()
+  T.slash("")
+  selected(3, "reopened: Alerts still selected")
+  placed("reopened")
+
+  check(tabs[3]:GetMotionScriptsWhileDisabled(), "the template's tabs run their motion scripts while disabled")
+  check(T.hover(tabs[1]) and GameTooltip.shown and GameTooltip.owner == tabs[1] and T.tooltipHas("Zone") and T.tooltipHas(TIPS[1]), "hovering Zone: its tooltip")
+  T.unhover(tabs[1])
+  check(not GameTooltip.shown, "gone on leaving it")
+  check(T.hover(tabs[3]) and T.tooltipHas("Alerts") and T.tooltipHas(TIPS[3]), "the selected tab, disabled by the template, still shows its tooltip")
+  T.unhover(tabs[3])
+  for i = 2, 4, 2 do
+    T.hover(tabs[i])
+    check(T.tooltipHas(LABELS[i]) and T.tooltipHas(TIPS[i]), LABELS[i] .. ": its tooltip")
+    T.unhover(tabs[i])
+  end
+  T.hover(tabs[2])
+  T.click(tabs[2])
+  check(not GameTooltip.shown, "clicking the hovered tab: the template's SelectTab takes its tooltip down")
+  check(T.hover(box) and T.tooltipHas("Preview") and T.tooltipHas("A made-up loop"), "the preview box has a tooltip saying what it shows")
+  T.unhover(box)
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks" .. joined(T.unknownBut()))
+  check(#T.errors == 0, "no errors")
+`);
+
+for (const [variant, label, setup] of [
+  ['none', 'no PanelTabButtonTemplate or InsetFrameTemplate', 'T.templates.PanelTabButtonTemplate = nil T.templates.InsetFrameTemplate = nil SOUNDKIT.IG_CHARACTER_INFO_TAB = nil\n'],
+  ['lacking', 'a tab template without LeftActive', 'T.tabTemplateWithout = "LeftActive"\n'],
+]) {
+  scenario('options tabs, plain (' + label + '): four plain tabs where the template\'s would be, their selection in colors, the pages, the sound, the box\'s border above them; the preview still runs', DISPLAY_HELPERS + TAB_HELPERS + 'local VARIANT = "' + variant + '"\n' + setup + String.raw`
+  T.login(200)
+  T.slash("")
+  local c, box = T.content(), T.previewBox()
+  local strip, tabs, pages = c.tabStrip, c.tabs, T.pages()
+  check(c.tabStyle == "plain" and #tabs == 4, "plain tabs (" .. tostring(c.tabStyle) .. ")")
+  local made = rawget(strip, "Tabs") or {}
+  if VARIANT == "lacking" then
+    check(#made == 1 and made[1]:IsShown() == false and made[1] ~= tabs[1], "the one template tab made before the fallback is hidden and left out")
+  else
+    check(#made == 0, "no template tab made")
+  end
+  check(rawget(strip, "numTabs") == nil, "no numTabs for PanelTemplates")
+  local boxes = tabBoxes(c)
+  check(boxes ~= nil, "tab 1 at the strip's top left, each next one LEFT on the last one's RIGHT")
+  for i, tab in ipairs(tabs) do
+    check(tab.template == nil and tab:IsVisible() and tab.width == TAB_W and tab.height == 24, "tab " .. i .. ": plain, shown, 120x24 (" .. tostring(tab.width) .. "x" .. tostring(tab.height) .. ")")
+    check(tab.text == LABELS[i] and tab.Text and tab.Text.text == LABELS[i] and tab:GetFontString() == tab.Text and tab:GetID() == i, "tab " .. i .. ": labelled " .. LABELS[i])
+    local tp = tab.Text.points
+    check(#tp == 1 and tp[1][1] == "CENTER" and tp[1][2] == nil and (tp[1][4] or 0) == 0 and (tp[1][5] or 0) == 0, "tab " .. i .. ": its label centred both ways")
+    local hl
+    for _, t in ipairs(tab.textures) do if t.layer == "HIGHLIGHT" then hl = t end end
+    check(tab.swBg and tab.swBg.layer == "BACKGROUND" and hl and hl.colorTex, "tab " .. i .. ": a color texture behind it and a highlight")
+    local b = boxes and boxes[i]
+    if b then
+      local x = BOX_X + TAB_X + (i - 1) * (TAB_W + TAB_GAP)
+      check(close(b.x0, x, 1e-9) and close(b.y0, PREVIEW_H - TAB_TUCK, 1e-9) and close(b.y1, PREVIEW_H - TAB_TUCK + 24, 1e-9),
+        "tab " .. i .. " at " .. x .. ", its top 1 up under the box, level with the others (" .. num(b.x0) .. ", " .. num(b.y0) .. " to " .. num(b.y1) .. ")")
+    end
+  end
+  if VARIANT == "none" then
+    local bg = box.textures[1]
+    local nine = box.NineSlice
+    local lines = 0
+    for _, t in ipairs(nine and nine.textures or {}) do
+      if t.layer == "BORDER" and t.colorTex and (t.height == 1 or t.width == 1) then lines = lines + 1 end
+    end
+    check(box.template == nil and bg and bg.layer == "BACKGROUND" and bg.colorTex and near(bg.colorTex[1], 0) and near(bg.colorTex[4], 0.35), "the plain box: a dark color texture behind the preview")
+    check(nine and nine:GetParent() == box and lines == 4, "and its four 1 px lines on a frame of their own (" .. lines .. ")")
+  end
+  local function selected(i, what)
+    local bad = {}
+    for k, tab in ipairs(tabs) do
+      local on = k == i
+      local bg = tab.swBg.colorTex
+      local want = on and { 0.35, 0.28, 0.12, 1 } or { 0.12, 0.1, 0.07, 0.95 }
+      if tab.selected ~= on then bad[#bad + 1] = "tab " .. k .. " selected " .. tostring(tab.selected) end
+      if not (close(bg[1], want[1], 1e-9) and close(bg[2], want[2], 1e-9) and close(bg[3], want[3], 1e-9) and close(bg[4], want[4], 1e-9)) then bad[#bad + 1] = "tab " .. k .. " color" end
+      if not tab:IsEnabled() then bad[#bad + 1] = "tab " .. k .. " disabled" end
+      if pages[k]:IsShown() ~= on then bad[#bad + 1] = "page " .. k .. (on and " hidden" or " shown") end
+    end
+    if c.swTab ~= i then bad[#bad + 1] = "c.swTab " .. tostring(c.swTab) end
+    for _, b in ipairs(levelProblems(c, i, false)) do bad[#bad + 1] = b end
+    check(#bad == 0, what .. joined(bad))
+  end
+  selected(1, "Zone first")
+  for _, i in ipairs({ 2, 3, 4, 1, 2 }) do
+    local sounds = #T.sounds
+    T.click(tabs[i])
+    check(#T.sounds == sounds + 1 and T.sounds[#T.sounds].id == 841, LABELS[i] .. ": the tab sound, 841 (" .. tostring(T.sounds[#T.sounds] and T.sounds[#T.sounds].id) .. ")")
+    selected(i, LABELS[i] .. ": its tab in the selected color, only its page")
+  end
+  check(T.checkbox("Lock in place"):IsVisible() and not T.checkbox("Show the red zone"):IsVisible(), "only the Display page's controls")
+  T.closePanel()
+  T.slash("")
+  selected(2, "reopened on Display")
+  T.hover(tabs[3])
+  check(T.tooltipHas("Alerts") and T.tooltipHas(TIPS[3]), "the tooltips")
+  T.unhover(tabs[3])
+  T.update()
+  check(T.isShown(T.preview().bar.stand) and T.preview():IsVisible(), "the preview runs")
+  check(T.button("Defaults"):IsVisible(), "Defaults under the page")
+  local allowed = VARIANT == "lacking" and { "Button.LeftActive" } or {}
+  check(#T.unknownBut(allowed) == 0, "no widget field read that the client lacks, but the template's LeftActive looked for" .. joined(T.unknownBut(allowed)))
+  check(#T.errors == 0, "no errors")
+`);
+}
+
+scenario('options: /shotwindow debug names the tab style and the preview box', String.raw`
+  T.login(200)
+  T.slash("")
+  T.slash("debug")
+  check(T.said("tabs=PanelTabButtonTemplate"), "the debug report names the tab style, tabs=PanelTabButtonTemplate: BuildTabs sets optionsReport.tabs, but Debug() prints only page, open, window, slider, check, swatch and picker")
+  check(T.said("preview=InsetFrameTemplate"), "the debug report names the preview box, preview=InsetFrameTemplate: BuildPreview sets optionsReport.preview, which Debug() never prints")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('options preview: the game\'s bar follows the Zone settings through the made-up loop (band, colors, alphas, pulse, hold, line, fill, tint, pip, time, late readout); a Zone change shows on the next frame', DISPLAY_HELPERS + PREVIEW_HELPERS + String.raw`
+  T.login(200)
+  local db = ShotWindowDB
+  T.slash("")
+  local stage = T.preview()
+  local g = stage and stage.bar
+  check(g and stage:IsVisible() and g.frame:IsVisible() and T.pages()[1]:IsVisible(), "the preview's game bar over the Zone tab")
+  startLoop()
+  -- Blizzard_SwingTimer.xml: a 240x30 frame, its StatusBar 5 in from the sides and 4 from the top and bottom.
+  local a, b = g.sb.points[1], g.sb.points[2]
+  check(g.frame.width == 240 and g.frame.height == 30 and #g.sb.points == 2 and a[1] == "TOPLEFT" and a[2] == 5 and a[3] == -4
+    and b[1] == "BOTTOMRIGHT" and b[2] == -5 and b[3] == 4 and g.sw == SW, "the status area 5 in from the sides, 4 from the top and bottom")
+  -- The marks on the real bar's layers: tint 5, band 6, line 7, over the fill at 0; the pip over them.
+  local rt = T.tex()
+  check(g.fill.layer == "ARTWORK" and g.fill.sublevel == 0 and g.tint.layer == "ARTWORK" and g.tint.sublevel == T.fillTint().sublevel
+    and g.stand.layer == rt.stand.layer and g.stand.sublevel == rt.stand.sublevel and g.line.layer == rt.line.layer and g.line.sublevel == rt.line.sublevel
+    and g.pip.layer == "OVERLAY", "the marks on the real bar's layers")
+  local fp = g.fill.points
+  check(#fp == 2 and fp[1][1] == "TOPLEFT" and fp[1][2] == nil and fp[2][1] == "BOTTOMLEFT" and fp[2][2] == nil, "the fill from the status area's top left and bottom left: its full height")
+  check(g.tint.points[1] and g.tint.points[1][1] == "ALL" and g.tint.points[1][2] == g.fill, "the tint laid over the fill")
+  local pp = g.pip.points[1]
+  check(pp and pp[1] == "RIGHT" and pp[2] == g.fill and pp[3] == "RIGHT" and pp[4] == 0 and pp[5] == 0, "the pip on the fill's right end, centred on it")
+  check(g.typeFS.text == SWING_TIMER_RANGED and g.typeFS.points[1][1] == "LEFT" and g.typeFS.points[1][2] == 10 and g.typeFS.points[1][3] == 0
+    and g.timeFS.points[1][1] == "RIGHT" and g.timeFS.points[1][2] == -10 and g.timeFS.points[1][3] == 0, "Ranged on the left, the time on the right, 10 in, both on the status area's middle line")
+  -- The late readout where the real bar has it: its bottom right 2 over the bar's top right.
+  local lp, rp = g.late.points[1], T.lateLabel().points[1]
+  check(lp and rp and lp[1] == rp[1] and lp[2] == g.sb and rp[2] == T.bar and lp[3] == rp[3] and lp[4] == rp[4] and lp[5] == rp[5] and lp[5] == 2,
+    "the late readout anchored as on the real bar (" .. tostring(lp and lp[1]) .. " on " .. tostring(lp and lp[3]) .. ", " .. tostring(lp and lp[5]) .. " up)")
+
+  -- want: band = x or false; color, alpha, pulse; line = x or false (lineWidth); fill = p or false;
+  -- tint = color or false; time; late = text or false.
+  local function bar(label, want)
+    local bad = {}
+    local x, width = bandOf(g)
+    if want.band == false then
+      if x ~= nil then bad[#bad + 1] = "band shown at " .. tostring(x) end
+    else
+      if not (close(x, want.band, 1e-9) and close(width, math.max(1, SW - want.band), 1e-9)) then
+        bad[#bad + 1] = "band at " .. tostring(x) .. " (width " .. tostring(width) .. "), want " .. num(want.band) .. " to " .. SW
+      end
+      if not colorIs(g.stand, want.color, want.alpha) then bad[#bad + 1] = "band color " .. colorStr(g.stand) .. ", want alpha " .. num(want.alpha) end
+      local pa = rawget(g.stand, "alpha") or 1
+      if not close(pa, want.pulse or 1, 1e-6) then bad[#bad + 1] = "band's own alpha " .. num(pa) .. ", want " .. num(want.pulse or 1) end
+    end
+    local lx = lineOf(g)
+    if want.line == false then
+      if lx ~= nil then bad[#bad + 1] = "line shown at " .. tostring(lx) end
+    else
+      if not close(lx, want.line, 1e-9) then bad[#bad + 1] = "line at " .. tostring(lx) .. ", want " .. num(want.line) end
+      if g.line.width ~= (want.lineWidth or 2) or not colorIs(g.line, db.lineColor, 0.95) then bad[#bad + 1] = "line " .. tostring(g.line.width) .. " px in " .. colorStr(g.line) end
+    end
+    if want.fill then
+      if not (T.isShown(g.fill) and close(g.fill.width, math.max(1, SW * want.fill), 1e-9)) then bad[#bad + 1] = "fill " .. tostring(T.isShown(g.fill)) .. " " .. num(g.fill.width) .. ", want " .. num(SW * want.fill) end
+      if not T.isShown(g.pip) then bad[#bad + 1] = "pip hidden" end
+    else
+      if T.isShown(g.fill) or T.isShown(g.pip) then bad[#bad + 1] = "fill or pip shown while the bar is empty" end
+    end
+    if want.tint then
+      if not (T.isShown(g.tint) and colorIs(g.tint, want.tint, db.fillAlpha)) then bad[#bad + 1] = "tint " .. tostring(T.isShown(g.tint)) .. " " .. colorStr(g.tint) end
+    elseif T.isShown(g.tint) then bad[#bad + 1] = "tint shown" end
+    if g.timeFS.text ~= want.time then bad[#bad + 1] = "time " .. tostring(g.timeFS.text) .. ", want " .. want.time end
+    if want.late then
+      if not (g.late:IsShown() and g.late.text == want.late and sameRGB(g.late.textColor, db.clipColor)) then bad[#bad + 1] = "late readout " .. tostring(g.late:IsShown()) .. " " .. tostring(g.late.text) end
+    elseif g.late:IsShown() then bad[#bad + 1] = "late readout shown (" .. tostring(g.late.text) .. ")" end
+    check(#bad == 0, label .. (#bad > 0 and (": " .. table.concat(bad, "; ")) or ""))
+  end
+
+  local RED, CLIP = db.color, db.clipColor
+  local zx = SW * 2.3 / 2.8 -- (dur - lead) / dur of the status width: 2.8 s, the last 0.5 s
+  at(1.0) bar("1.0 s: before the zone", { band = zx, color = RED, alpha = 0.35, line = zx, fill = 1.0 / 2.8, time = "1.8" })
+  at(2.5) bar("2.5 s: in the zone, brightened", { band = zx, color = RED, alpha = 0.65, line = zx, fill = 2.5 / 2.8, time = "0.3" })
+  at(5.2) bar("the second swing, moving in the zone: clipping", { band = zx, color = CLIP, alpha = 0.65, line = zx, fill = 2.4 / 2.8, time = "0.4" })
+  at(5.7) bar("waiting, 0.1 s: lit, no pulse yet, the bar empty", { band = zx, color = RED, alpha = 0.65, line = zx, fill = false, time = "0.0" })
+  at(5.95) bar("waiting, 0.35 s: pulsing", { band = zx, color = RED, alpha = 0.65, pulse = pulseAt(0.35), line = zx, fill = false, time = "0.0" })
+  at(6.1) bar("waiting, 0.5 s: pulsing", { band = zx, color = RED, alpha = 0.65, pulse = pulseAt(0.5), line = zx, fill = false, time = "0.0" })
+  at(6.7) bar("the third swing: how late the last shot was, on the bar", { band = zx, color = RED, alpha = 0.35, line = zx, fill = 0.5 / 2.8, time = "2.3", late = "+0.60" })
+  check(not stage.late:IsShown(), "no display: nothing under a display")
+  at(7.8) bar("1.6 s into it: the readout gone", { band = zx, color = RED, alpha = 0.35, line = zx, fill = 1.6 / 2.8, time = "1.2" })
+
+  -- The Zone page's options, each on the next frame.
+  T.click(T.checkbox("Tint the fill inside the zone"))
+  check(db.fillTint == true, "fill tint on")
+  at(2.5) bar("fill tint: the fill tinted while lit", { band = zx, color = RED, alpha = 0.65, line = zx, fill = 2.5 / 2.8, tint = db.fillColor, time = "0.3" })
+  at(1.0) bar("fill tint: not before the zone", { band = zx, color = RED, alpha = 0.35, line = zx, fill = 1.0 / 2.8, time = "1.8" })
+  at(5.2) bar("fill tint: the clip color while moving", { band = zx, color = CLIP, alpha = 0.65, line = zx, fill = 2.4 / 2.8, tint = CLIP, time = "0.4" })
+  at(5.7) bar("fill tint: nothing to tint while waiting", { band = zx, color = RED, alpha = 0.65, line = zx, fill = false, time = "0.0" })
+  T.click(T.checkbox("Brighten inside the zone"))
+  at(2.5) bar("flash off: the idle alpha inside the zone", { band = zx, color = RED, alpha = 0.35, line = zx, fill = 2.5 / 2.8, tint = db.fillColor, time = "0.3" })
+  T.click(T.checkbox("Brighten inside the zone"))
+  T.click(T.checkbox("Pulse while waiting for a late shot"))
+  at(5.95) bar("pulse off: lit and steady while waiting", { band = zx, color = RED, alpha = 0.65, line = zx, fill = false, time = "0.0" })
+  T.click(T.checkbox("Pulse while waiting for a late shot"))
+  T.click(T.checkbox("Keep the zone lit until the shot fires"))
+  check(db.hold == false, "hold off")
+  at(5.7) bar("hold off: the bar just ends", { band = zx, color = RED, alpha = 0.35, line = zx, fill = false, time = "0.0" })
+  at(5.95) bar("hold off: nothing pulses", { band = zx, color = RED, alpha = 0.35, line = zx, fill = false, time = "0.0" })
+  at(6.7) bar("hold off: nothing measures a late shot", { band = zx, color = RED, alpha = 0.35, line = zx, fill = 0.5 / 2.8, time = "2.3" })
+  T.click(T.checkbox("Keep the zone lit until the shot fires"))
+  T.click(T.checkbox("Show the marker line"))
+  at(1.0) bar("line off", { band = zx, color = RED, alpha = 0.35, line = false, fill = 1.0 / 2.8, time = "1.8" })
+  T.click(T.checkbox("Show the marker line"))
+  T.drag(T.slider("Thickness"), 4)
+  T.click(T.swatch("Line color")) T.pickColor(0.1, 0.9, 0.2) T.pickerOkay()
+  at(1.0) bar("line 4 px in the picked color", { band = zx, color = RED, alpha = 0.35, line = zx, lineWidth = 4, fill = 1.0 / 2.8, time = "1.8" })
+  check(sameRGB(db.lineColor, { 0.1, 0.9, 0.2 }), "the line color picked")
+  T.click(T.checkbox("Show the red zone"))
+  at(1.0) bar("band off: the line stays", { band = false, line = zx, lineWidth = 4, fill = 1.0 / 2.8, time = "1.8" })
+  T.click(T.checkbox("Show the red zone"))
+  T.click(T.swatch("Zone color")) T.pickColor(0.2, 0.3, 0.9) T.pickerOkay()
+  at(1.0) bar("the picked zone color", { band = zx, color = { 0.2, 0.3, 0.9 }, alpha = 0.35, line = zx, lineWidth = 4, fill = 1.0 / 2.8, time = "1.8" })
+  RED = db.color
+  T.drag(T.slider("Zone opacity"), 50)
+  at(1.0) bar("zone opacity 50%", { band = zx, color = RED, alpha = 0.5, line = zx, lineWidth = 4, fill = 1.0 / 2.8, time = "1.8" })
+  T.drag(T.slider("Fill opacity"), 40)
+  at(2.5) bar("fill opacity 40%", { band = zx, color = RED, alpha = 0.65, line = zx, lineWidth = 4, fill = 2.5 / 2.8, tint = db.fillColor, time = "0.3" })
+  check(near(db.fillAlpha, 0.4), "fill alpha 0.4")
+  T.drag(T.slider("Aim window (the shot's wind-up)"), 800)
+  T.update()
+  local x8 = SW * 2.0 / 2.8
+  local px = bandOf(g)
+  check(close(px, x8, 1e-9) and close(lineOf(g), x8, 1e-9), "aim window 0.80 s: the band and line move on the next frame (" .. num(px) .. ", want " .. num(x8) .. ")")
+  local rx = T.span(rt.stand)
+  check(close(px / SW, rx / 200, 1e-9), "at the same fraction of the bar as on the game's own bar (" .. num(px / SW) .. ", " .. num(rx / 200) .. ")")
+  -- A lead as long as the swing: the band from the start, and no line at x = 0.
+  T.speed.rng = 1.0
+  T.drag(T.slider("Aim window (the shot's wind-up)"), 1000)
+  at(0.5)
+  local bx, bw = bandOf(g)
+  check(bx == 0 and close(bw, SW, 1e-9) and lineOf(g) == nil, "a 1 s lead on a 1 s weapon: the band from 0 across the bar, no line at 0 (" .. tostring(bx) .. ", " .. tostring(lineOf(g)) .. ")")
+  T.drag(T.slider("Aim window (the shot's wind-up)"), 0)
+  T.update()
+  check(bandOf(g) == nil and lineOf(g) == nil, "no lead: no band and no line")
+  T.speed.rng = 2.8
+  T.drag(T.slider("Aim window (the shot's wind-up)"), 500)
+  -- Moving does not clip with the warning off.
+  T.click(T.tab(3))
+  T.click(T.checkbox("Warn when I move inside the zone"))
+  at(5.2) bar("warning off: no clip color", { band = zx, color = RED, alpha = 0.65, line = zx, lineWidth = 4, fill = 2.4 / 2.8, tint = db.fillColor, time = "0.4" })
+  T.click(T.checkbox("Warn when I move inside the zone"))
+  -- With a display of its own the late readout moves under it.
+  T.slash("display classic")
+  at(6.7)
+  check(not g.late:IsShown() and stage.late:IsShown() and stage.late.text == "+0.60" and sameRGB(stage.late.textColor, db.clipColor),
+    "a display: the late readout under it, not on the bar")
+  local lp = stage.late.points[1]
+  check(lp and lp[1] == "TOPRIGHT" and lp[2] == stage.renderer.frame and lp[3] == "BOTTOMRIGHT" and lp[4] == 0 and lp[5] == -2, "under the display's right end")
+  T.click(T.tab(1))
+  T.click(T.checkbox("Keep the zone lit until the shot fires"))
+  at(6.7)
+  check(not g.late:IsShown() and not stage.late:IsShown(), "hold off: no late readout under the display either")
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks" .. (#T.unknownBut() > 0 and (": " .. table.concat(T.unknownBut(), ", ")) or ""))
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('options preview: the layout: no display puts the game\'s bar in the middle; a display puts the bar in the left quarter and the display in the right one; on the bar both in the middle, the display above it; all on one middle line under the names; the display scaled to fit its cell; the call-out at most 20 pt', DISPLAY_HELPERS + PREVIEW_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  T.slash("")
+  local stage = T.preview()
+  local g, r = stage.bar, stage.renderer
+  local cell = r.frame:GetParent()
+  local WIDTH, HEIGHT, NAMES_ROW, CALLOUT_ROW, BOTTOMROOM = 584, 132, 18, 22, 14
+  local TOPROW = NAMES_ROW + CALLOUT_ROW -- the drawing starts under the names and the call-out
+  local MID = -(TOPROW + (HEIGHT - TOPROW - BOTTOMROOM) / 2) -- the middle of the room for the drawing
+  check(stage.width == WIDTH and stage.height == HEIGHT and cell:GetParent() == stage and cell.points[1] and cell.points[1][1] == "ALL", "the stage and the display's cell fill the 584x132 box")
+  startLoop()
+  local words = stage.say:GetParent()
+  local barName = textOn(words, "The game's swing bar")
+  local bp, dp = barName and barName.points[1], stage.dispName.points[1]
+  check(bp and bp[1] == "TOPLEFT" and bp[2] == 8 and bp[3] == -5, "the bar's name at the top left, 8 in and 5 down")
+  check(dp and dp[1] == "TOPRIGHT" and dp[2] == -8 and dp[3] == -5 and stage.dispName.justifyH == "RIGHT", "the display's name at the top right, on the same line, flush right")
+  check(cell:GetFrameLevel() > g.frame:GetFrameLevel() and cell:GetFrameLevel() > g.sb:GetFrameLevel() and words:GetFrameLevel() > cell:GetFrameLevel(),
+    "the display's cell above the bar, the words above both (" .. g.frame:GetFrameLevel() .. ", " .. cell:GetFrameLevel() .. ", " .. words:GetFrameLevel() .. ")")
+  local function barAt(x, label)
+    local bx, by = landsAt(g.frame, stage)
+    check(close(bx, x, 1e-9) and close(by, MID, 1e-9), label .. ": the bar centred at (" .. x .. ", " .. MID .. ") (got " .. num(bx) .. ", " .. num(by) .. ")")
+    check(by and -by - 15 >= TOPROW and -by + 15 <= HEIGHT - BOTTOMROOM, label .. ": the bar between the names and the room under it")
+  end
+  local function sayAt(x, label)
+    local p = stage.say.points[1]
+    check(#stage.say.points == 1 and p[1] == "TOP" and p[2] == stage and p[3] == "TOPLEFT" and close(p[4], x, 1e-9) and p[5] == -NAMES_ROW,
+      label .. ": the call-out over x = " .. x .. ", in its own row under the names (" .. tostring(p and p[4]) .. ", " .. tostring(p and p[5]) .. ")")
+  end
+  local function dispAt(x, fitW, label)
+    local s = r.frame:GetScale()
+    local fit = math.min(1, fitW / r.w, (HEIGHT - TOPROW - BOTTOMROOM) / r.h)
+    check(close(s, fit, 0.002), label .. ": scaled to fit its cell, " .. fitW .. " by " .. (HEIGHT - TOPROW - BOTTOMROOM) .. " (" .. num(s) .. ", want " .. num(fit) .. ")")
+    check(r.w * s <= fitW + 0.01 and r.h * s <= HEIGHT - TOPROW - BOTTOMROOM + 0.01, label .. ": " .. num(r.w * s) .. "x" .. num(r.h * s) .. " drawn, within the cell")
+    local dx, dy = landsAt(r.frame, cell)
+    check(close(dx, x, 0.01) and close(dy, MID, 0.01), label .. ": the display centred at (" .. x .. ", " .. MID .. "), on the bar's middle line (lands at "
+      .. num(dx) .. ", " .. num(dy) .. " at scale " .. num(s) .. ")")
+    local rp = r.frame.points[1]
+    check(#r.frame.points == 1 and rp[1] == "CENTER" and rp[3] == "CENTER" and (rp[4] or 0) == 0 and (rp[5] or 0) == 0 and (rawget(rp[2], "scale") or 1) == 1,
+      label .. ": the display hangs from an unscaled slot with no offsets, so its scale cannot move it")
+  end
+
+  at(1.0)
+  barAt(WIDTH / 2, "no display")
+  sayAt(WIDTH / 2, "no display")
+  check(not r.frame:IsVisible() and stage.dispName.text == "No display of its own", "no display: none drawn, and the name says so")
+
+  for _, d in ipairs({ "classic", "ring", "vpincer" }) do
+    T.slash("display " .. d)
+    at(1.0)
+    check(r.frame:IsVisible() and r.design == d and stage.dispName.text == "Display: " .. NS.DISPLAY_NAMES[d], d .. ": drawn and named")
+    barAt(WIDTH / 4, d .. " beside")
+    dispAt(WIDTH * 3 / 4, WIDTH / 2 - 24, d .. " beside")
+    sayAt(WIDTH * 3 / 4, d .. " beside")
+  end
+  T.slash("display classic")
+  T.click(T.tab(2))
+  T.click(T.checkbox("Sit on the game's swing bar"))
+  check(db.dispOnBar == true, "on the bar")
+  for _, d in ipairs({ "classic", "ring" }) do
+    T.slash("display " .. d)
+    at(1.0)
+    check(stage.dispName.text == "Display: " .. NS.DISPLAY_NAMES[d] .. ", on the bar", d .. " on the bar: named so (" .. tostring(stage.dispName.text) .. ")")
+    barAt(WIDTH / 2, d .. " on the bar")
+    dispAt(WIDTH / 2, WIDTH - 24, d .. " on the bar")
+    sayAt(WIDTH / 2, d .. " on the bar")
+    check(cell:GetFrameLevel() > g.frame:GetFrameLevel() and r.frame:IsVisible(), d .. " on the bar: drawn above it")
+  end
+  T.slash("display none")
+  at(1.0)
+  barAt(WIDTH / 2, "none again")
+  check(not r.frame:IsVisible(), "none again: no display")
+
+  -- The call-out: at most 20 pt here, whatever size it is set to.
+  T.click(T.tab(3))
+  T.click(T.checkbox("Say Stop, Moving, Late and Go"))
+  at(2.5)
+  check(stage.say:IsShown() and stage.say.text == "Stop" and stage.say.fontSize == 20, "26 pt set: Stop at 20 pt (" .. tostring(stage.say.fontSize) .. ")")
+  T.drag(T.slider("Text size"), 14)
+  at(2.6)
+  check(stage.say.fontSize == 14, "14 pt set: 14 pt (" .. tostring(stage.say.fontSize) .. ")")
+  T.drag(T.slider("Text size"), 60)
+  at(5.2)
+  check(stage.say.text == "Moving" and stage.say.fontSize == 20, "60 pt set: 20 pt, Moving (" .. tostring(stage.say.fontSize) .. ")")
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks" .. (#T.unknownBut() > 0 and (": " .. table.concat(T.unknownBut(), ", ")) or ""))
+  check(#T.errors == 0, "no errors")
+`);
+
+// The preview's game bar in the window styles, and without atlas info.
+const EUI_LOOK_PRE = EUI_PRE + String.raw`
+  EUI_S.SetTabSelection = function(tab, on) EUISEL = EUISEL or {} EUISEL[#EUISEL + 1] = { tab, on } end
+`;
+for (const [look, label, pre, setup] of [
+  ['blizzard', 'Blizzard: the swing timer art', null, ''],
+  ['dark', 'Dark: flat, the accent fill', null, 'ShotWindowDB = { style = "dark" }\n'],
+  ['eui', 'the EllesmereUI stand-in: flat in its colors', EUI_LOOK_PRE, ''],
+  ['live', 'Blizzard, then Dark chosen on the Look tab', null, ''],
+  ['missing', 'no C_Texture.GetAtlasInfo: flat', null, 'T.atlasMode = "missing"\n'],
+  ['nil', 'GetAtlasInfo answers nothing: flat', null, 'T.atlasMode = "nil"\n'],
+  ['error', 'GetAtlasInfo raises: flat', null, 'T.atlasMode = "error"\n'],
+]) {
+  scenario('options preview look (' + label + '): the game\'s bar drawn as the style draws the real one', DISPLAY_HELPERS + PREVIEW_HELPERS + 'local LOOK = "' + look + '"\n' + setup + String.raw`
+  GameFontNormal = { GetFont = function() return "Fonts\\STYLE.TTF", 12, "" end } -- read by Dark's GetFont
+  T.login(200)
+  if LOOK == "eui" then EUI_FN(EUI_S) end
+  T.fire("PLAYER_ENTERING_WORLD")
+  T.slash("")
+  local stage = T.preview()
+  local g = stage.bar
+  startLoop()
+  at(1.0)
+  if LOOK == "live" then
+    check(g.bg.atlas == "ui-swingtimerbar-background" and T.isShown(g.bg), "Blizzard first: the art")
+    T.click(T.tab(4))
+    T.click(T.button("Window style: Automatic"), "RightButton")
+    check(NS.Styles.Applied() == "dark", "Dark chosen")
+    T.update()
+  end
+  local ART = LOOK == "blizzard"
+  local STYLED = LOOK == "dark" or LOOK == "eui" or LOOK == "live"
+  local function shownAtlases()
+    local list = {}
+    for _, f in ipairs({ g.frame, g.sb }) do
+      for _, t in ipairs(f.textures) do if T.isShown(t) and rawget(t, "atlas") then list[#list + 1] = t.atlas end end
+    end
+    return list
+  end
+  if ART then
+    check(g.bg.atlas == "ui-swingtimerbar-background" and T.isShown(g.bg) and g.bg.points[1][1] == "ALL" and g.bg.layer == "BACKGROUND" and g.bg.sublevel == 0,
+      "the background atlas over the whole frame")
+    check(g.border.atlas == "ui-swingtimerbar-frame" and T.isShown(g.border) and g.border.points[1][1] == "ALL" and g.border.layer == "BACKGROUND" and g.border.sublevel == 1,
+      "the frame atlas over it")
+    local v = rawget(g.fill, "vertex")
+    check(g.fill.atlas == "ui-swingtimerbar-filling-ranged" and v and v[1] == 1 and v[2] == 1 and v[3] == 1 and v[4] == 1, "the ranged fill, untinted")
+    check(g.pip.atlas == "ui-swingtimerbar-pip" and T.isShown(g.pip), "the pip")
+    local sp = g.shadow.points
+    check(g.shadow.atlas == "ui-swingtimerbar-textshadow-left" and T.isShown(g.shadow) and g.shadow.width == 171 and #sp == 2 and sp[1][1] == "TOPLEFT" and sp[2][1] == "BOTTOMLEFT",
+      "the label's shadow, 171 wide, the status area's height")
+    local edges = 0
+    for i = 1, 4 do if T.isShown(g.edges[i]) then edges = edges + 1 end end
+    check(not T.isShown(g.track) and edges == 0, "no flat track or edges")
+    local l, rr, tt, bb = T.atlasCoords("ui-swingtimerbar-filling-ranged")
+    for _, s in ipairs({ { 0.3, 0.3 / 2.8 }, { 1.0, 1.0 / 2.8 }, { 1.9, 1.9 / 2.8 }, { 2.75, 2.75 / 2.8 }, { 3.5, 0.7 / 2.8 } }) do
+      at(s[1])
+      local p, tc = s[2], rawget(g.fill, "texCoord")
+      check(tc and close(tc[1], l, 1e-12) and close(tc[2], l + (rr - l) * p, 1e-12) and close(tc[3], tt, 1e-12) and close(tc[4], bb, 1e-12)
+        and close(g.fill.width, SW * p, 1e-9), num(s[1]) .. " s: the fill reveals exactly " .. num(p) .. " of the art, across " .. num(SW * p) .. " px ("
+        .. (tc and (num(tc[1]) .. ".." .. num(tc[2]) .. ", " .. num(tc[3]) .. ".." .. num(tc[4])) or "no texcoord") .. ", " .. num(g.fill.width) .. " px)")
+    end
+    check(g.typeFS.fontCalls == nil, "the game's label font")
+  else
+    local shown = shownAtlases()
+    local others = {}
+    for _, a in ipairs(shown) do if a ~= "ui-swingtimerbar-textshadow-left" then others[#others + 1] = a end end
+    check(#others == 0, "no bar art shown" .. (#others > 0 and (" (" .. table.concat(others, ", ") .. ")") or ""))
+    check(not T.isShown(g.bg) and not T.isShown(g.border) and T.isShown(g.track), "flat: a track in place of the art")
+    if STYLED then
+      check(T.isShown(g.shadow) and g.shadow.atlas == "ui-swingtimerbar-textshadow-left", "the text shadow kept, as the real flat bar keeps it")
+    end
+    local tc, ac, ec
+    if STYLED then
+      local r0, g0, b0 = NS.Styles.S.GetPanelColor()
+      local ar, ag, ab = NS.Styles.S.GetAccentColor()
+      tc, ac, ec = { r0, g0, b0, 0.85 }, { ar, ag, ab, 1 }, { 0, 0, 0, 1 }
+    else
+      tc, ac, ec = { 0.05, 0.05, 0.06, 0.7 }, { 0.85, 0.62, 0.2, 1 }, { 0.8, 0.65, 0.3, 0.9 }
+    end
+    check(colorIs(g.track, tc, tc[4]), "the track " .. colorStr(g.track))
+    check(colorIs(g.fill, ac, 1) and T.isShown(g.fill) and close(g.fill.width, SW / 2.8, 1e-9), "the fill in the accent " .. colorStr(g.fill))
+    local edges = 0
+    for i = 1, 4 do if T.isShown(g.edges[i]) and colorIs(g.edges[i], ec, ec[4]) then edges = edges + 1 end end
+    check(edges == 4, "a 1 px edge round the status area (" .. edges .. ")")
+    local pips = 0
+    for _, t in ipairs({ 0.5, 1.5, 2.5, 5.2, 5.9, 6.7 }) do at(t) if T.isShown(g.pip) then pips = pips + 1 end end
+    check(pips == 0, "no pip art at any point (" .. pips .. ")")
+    if STYLED then
+      -- As FlatBar does to the real labels: the game's font, then the style's Font (Dark's changes nothing).
+      local function gameFont(fs) local f = rawget(fs, "font") return f ~= nil and (f == GameFontHighlightSmall or f == "GameFontHighlightSmall") end
+      check(gameFont(g.typeFS) and gameFont(g.timeFS) and g.typeFS.fontCalls == nil,
+        "the labels in the game's font, as the real bar's (" .. tostring(g.typeFS.fontFile) .. ")")
+      if LOOK == "eui" then
+        check((EUIDONE[g.typeFS] or ""):find("Font", 1, true) and (EUIDONE[g.timeFS] or ""):find("Font", 1, true),
+          "and handed to EllesmereUI's Font, as the real bar's are")
+      end
+    end
+  end
+  at(2.5)
+  local x = SW * 2.3 / 2.8
+  check(T.isShown(g.stand) and close(g.stand.points[1][4], x, 1e-9) and rawget(g.stand, "colorTex")[4] == 0.65, "the zone over it as before")
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks" .. (#T.unknownBut() > 0 and (": " .. table.concat(T.unknownBut(), ", ")) or ""))
+  check(#T.errors == 0, "no errors")
+`, pre || undefined);
+}
+
+scenario('options layout: every control on the four pages lies on its page, below the tabs, above the Defaults row and inside the content width; the preview box spans W - 16; the canvas page hides its title and keeps scale 1 on the 665x601 canvas', DISPLAY_HELPERS + TAB_HELPERS + String.raw`
+  T.login(200)
+  T.slash("")
+  local c, page = T.content(), T.page()
+  local pages = T.pages()
+  check(c.width == W and c.height == CONTENT_H and #pages == 4, "the content 600x581 with four pages")
+  local box = c.previewBox
+  local bp = box.points[1]
+  check(#box.points == 1 and bp[1] == "TOPLEFT" and bp[2] == BOX_X and bp[3] == 0 and box.width == BOX_W and box.height == PREVIEW_H,
+    "the preview box at the top, 8 in from either side: " .. BOX_W .. " wide")
+  local reset = T.button("Defaults")
+  local rp = reset.points[1]
+  local resetTop = CONTENT_H - rp[3] - reset.height -- y down
+  check(rp[1] == "BOTTOMLEFT" and resetTop > PAGE_TOP + PAGE_H, "the Defaults row under the pages (its top at " .. resetTop .. ")")
+  local tabBottom = 0
+  for _, b in ipairs(tabBoxes(c) or {}) do tabBottom = math.max(tabBottom, b.y1) end
+  check(tabBottom > 0 and tabBottom <= PAGE_TOP, "the tabs end (" .. tabBottom .. ") before the pages start (" .. PAGE_TOP .. ")")
+  -- Text the way the stub measures it: 6 px a character, about 14 px a line (plus any spacing).
+  local function textBox(fs)
+    local text = rawget(fs, "text") or ""
+    local w = rawget(fs, "width") or 0
+    local lines = 0
+    for para in (text .. "\n"):gmatch("(.-)\n") do lines = lines + ((w > 0) and math.max(1, math.ceil(#para * 6 / w)) or 1) end
+    return (w > 0) and w or fs:GetStringWidth(), lines * (14 + (rawget(fs, "spacing") or 0))
+  end
+  local labels = { "Zone", "Display", "Alerts", "Look" }
+  for i, p in ipairs(pages) do
+    local pp = p.points[1]
+    check(pp[1] == "TOPLEFT" and pp[2] == 0 and pp[3] == -PAGE_TOP and p.width == W and p.height == PAGE_H, labels[i] .. ": the page at " .. PAGE_TOP .. ", 600x384")
+    local out, n = {}, 0
+    local function place(what, x0, y0, x1, y1)
+      n = n + 1
+      if x0 < 0 or x1 > W or y0 < 0 or y1 > PAGE_H then
+        out[#out + 1] = what .. string.format(" (%.0f,%.0f to %.0f,%.0f)", x0, y0, x1, y1)
+      end
+    end
+    for _, f in ipairs(p.children) do
+      local a = f.points[1]
+      if a and a[1] == "TOPLEFT" and type(a[2]) == "number" and type(a[3]) == "number" then
+        local x0, y0 = a[2], -a[3]
+        place(f.kind .. " " .. tostring(rawget(f, "text") or ""), x0, y0, x0 + f.width, y0 + f.height)
+        -- a checkbox's or swatch's label, LEFT on its RIGHT
+        for _, fs in ipairs(f.fontStrings) do
+          local q = fs.points[1]
+          if q and q[1] == "LEFT" and q[2] == f and q[3] == "RIGHT" then
+            local w = fs:GetStringWidth()
+            place("label " .. tostring(fs.text), x0 + f.width + q[4], y0, x0 + f.width + q[4] + w, y0 + f.height)
+          end
+        end
+      end
+    end
+    for _, fs in ipairs(p.fontStrings) do
+      local a = fs.points[1]
+      if a and a[1] == "TOPLEFT" and type(a[2]) == "number" then
+        local w, h = textBox(fs)
+        place("text " .. tostring(fs.text):sub(1, 30), a[2], -a[3], a[2] + w, -a[3] + h)
+      end
+    end
+    for _, t in ipairs(p.textures) do
+      local a = t.points[1]
+      if a and a[1] == "TOPLEFT" and type(a[2]) == "number" then place("rule", a[2], -a[3], a[2] + t.width, -a[3] + t.height) end
+    end
+    check(n >= 6 and #out == 0, labels[i] .. ": " .. n .. " pieces on the page, all inside it" .. (#out > 0 and (": not " .. table.concat(out, ", ")) or ""))
+  end
+  -- The canvas page: the preview in the title's place, the content 6 in and 10 down at full size.
+  local title = page.fontStrings[1]
+  check(title and title.text == "Shot Window" and title.shown == false, "the page's own title hidden while the tabs show")
+  local cp = c.points[1]
+  check(T.canvas.width == 665 and T.canvas.height == 601 and c:GetScale() == 1 and cp[1] == "TOPLEFT" and cp[2] == page and cp[4] == 6 and cp[5] == -10,
+    "scale 1 on the 665x601 canvas, 6 in and 10 down (" .. tostring(c:GetScale()) .. ", " .. tostring(cp[4]) .. ", " .. tostring(cp[5]) .. ")")
+  check(10 + CONTENT_H <= 601 and 6 + W <= 665, "the content fits the canvas")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('options layout: a class without Auto Shot or a wand: no tabs or preview, the page keeps its title and shows the look under it', String.raw`
+  T.className, T.class = "Rogue", "ROGUE"
+  T.login(200)
+  T.slash("")
+  local page = T.page()
+  local c
+  for _, f in ipairs(T.frames) do if rawget(f, "parent") == page and rawget(f, "swParts") then c = f end end
+  check(c ~= nil and c:IsVisible() and rawget(c, "tabs") == nil and rawget(c, "pages") == nil and rawget(c, "preview") == nil and rawget(c, "previewBox") == nil,
+    "no tabs, pages or preview")
+  local title = page.fontStrings[1]
+  check(title and title.text == "Shot Window" and title.shown == true, "the page's title shown")
+  -- A short page of its own (Defaults sits at its bottom), so it is not scaled down.
+  check(c and c.height == 210, "a short page, 210 high (" .. tostring(c and c.height) .. ")")
+  local cp, want = c and c.points[1], 1
+  check(cp and near(c:GetScale(), want) and near(cp[4] * want, 6) and near(cp[5] * want, -42), "the content under the title, 6 in and 42 down at scale " .. want .. " (" .. tostring(c and c:GetScale()) .. ")")
+  local look
+  for _, fs in ipairs(c and c.fontStrings or {}) do if rawget(fs, "text") == "Look" then look = fs end end
+  check(look ~= nil and look:IsVisible(), "the Look section")
+  check(#T.errors == 0, "no errors")
+`);
+
+for (const [style, label, pre] of [['dark', 'Dark', null], ['eui', 'the EllesmereUI stand-in', EUI_LOOK_PRE]]) {
+  scenario('options tabs in a window style (' + label + '): the window copy\'s tabs go to S().Tab, its preview box to S().Panel as an inset, the selection to S().SetTabSelection on every ShowTab; the Options page copy is not restyled', STYLE_HELPERS + TAB_HELPERS + 'local STYLE = "' + style + '"\n' + String.raw`
+  if STYLE == "dark" then ShotWindowDB = { style = "dark" } end
+  T.openFails = true
+  T.login(200)
+  if STYLE == "eui" then EUI_FN(EUI_S) end
+  T.fire("PLAYER_ENTERING_WORLD")
+  local S = NS.Styles.S
+  check(S ~= nil and S.Tab and S.Panel and S.SetTabSelection, "a drawn style with Tab, Panel and SetTabSelection")
+  -- Every call recorded on its way to the style's own.
+  local calls = { Tab = {}, Panel = {}, Sel = {} }
+  local tab0, panel0, sel0 = S.Tab, S.Panel, S.SetTabSelection
+  S.Tab = function(t, ...) calls.Tab[#calls.Tab + 1] = t return tab0(t, ...) end
+  S.Panel = function(f, opts, ...) calls.Panel[#calls.Panel + 1] = { f, opts } return panel0(f, opts, ...) end
+  S.SetTabSelection = function(t, on) calls.Sel[#calls.Sel + 1] = { t, on } return sel0(t, on) end
+  T.slash("")
+  local w = T.window()
+  local own, shared = T.content(), T.contents()[1]
+  check(w and w:IsShown() and own ~= shared and own:GetParent() == w and own:IsVisible() and #T.contents() == 2, "the window shows its own copy")
+  local function count(list, x) local n = 0 for _, v in ipairs(list) do if v == x then n = n + 1 end end return n end
+  for i, tab in ipairs(own.tabs) do check(count(calls.Tab, tab) == 1, "the window's tab " .. i .. " to S().Tab once (" .. count(calls.Tab, tab) .. ")") end
+  check(#calls.Tab == 4, "only those four (" .. #calls.Tab .. ")")
+  local opts, other = {}, 0
+  for _, p in ipairs(calls.Panel) do
+    if p[1] == own.previewBox then opts[#opts + 1] = p[2] elseif p[1] == shared.previewBox then other = other + 1 end
+  end
+  check(#opts == 1 and type(opts[1]) == "table" and opts[1].inset == true and other == 0, "the window's preview box to S().Panel once, as an inset; not the page's")
+  -- The selection: the last four calls are the window copy's tabs, only the shown one on.
+  local function selection(i, what)
+    local bad = {}
+    if #calls.Sel < 4 then bad[1] = #calls.Sel .. " calls" end
+    for k = 1, 4 do
+      local call = calls.Sel[#calls.Sel - 4 + k]
+      if not call or call[1] ~= own.tabs[k] or call[2] ~= (k == i) then bad[#bad + 1] = "tab " .. k end
+    end
+    check(#bad == 0, what .. (#bad > 0 and (": " .. table.concat(bad, ", ")) or ""))
+  end
+  selection(1, "built: Zone selected in the style")
+  for _, i in ipairs({ 3, 2, 4, 1 }) do
+    local n = #calls.Sel
+    T.click(own.tabs[i])
+    check(#calls.Sel == n + 4, own.tabs[i].text .. ": SetTabSelection for each of the four tabs (" .. (#calls.Sel - n) .. ")")
+    selection(i, own.tabs[i].text .. ": only it selected in the style")
+    if STYLE == "dark" then
+      -- Dark draws the selection: the accent line under the selected tab only.
+      local lines = 0
+      for k, tab in ipairs(own.tabs) do
+        for _, t in ipairs(tab.textures) do
+          if t.layer == "OVERLAY" and t.height == 2 and T.isShown(t) then lines = lines + (k == i and 1 or 100) end
+        end
+      end
+      check(lines == 1, own.tabs[i].text .. ": Dark's accent line under it alone (" .. lines .. ")")
+    end
+  end
+  if STYLE == "dark" then
+    local box = own.previewBox
+    local faded = rawget(box.Bg, "alpha") == 0
+    for _, key in ipairs({ "TopLeftCorner", "TopEdge", "BottomRightCorner" }) do faded = faded and rawget(box.NineSlice[key], "alpha") == 0 end
+    check(faded, "Dark's panel faded the box's template art")
+    check(rawget(shared.previewBox.Bg, "alpha") == nil and rawget(shared.tabs[1].Left, "alpha") == nil, "the page copy's box and tabs keep the game's art")
+  else
+    local function did(f, what) return f ~= nil and (EUIDONE[f] or ""):find(what, 1, true) ~= nil end
+    check(did(own.tabs[1], "Tab") and did(own.previewBox, "Panel") and not did(shared.tabs[1], "Tab") and not did(shared.previewBox, "Panel"),
+      "EllesmereUI's calls on the window copy only")
+  end
+  -- The Options page shows the shared copy: its tabs switch with no style calls.
+  T.openPanelManually()
+  check(not w:IsShown() and shared:IsVisible(), "the page takes over with its own copy")
+  local nTab, nPanel, nSel = #calls.Tab, #calls.Panel, #calls.Sel
+  T.click(shared.tabs[3])
+  T.click(shared.tabs[2])
+  check(shared.pages[2]:IsVisible() and #calls.Tab == nTab and #calls.Panel == nPanel and #calls.Sel == nSel,
+    "the page copy's tabs switch with no style calls (" .. (#calls.Sel - nSel) .. " selections)")
+  check(shared.tabStrip.selectedTab == 2 and not shared.tabs[2]:IsEnabled(), "and its selection is the game's own")
+  -- Styles.lua looks for parts a widget may have (state textures, an icon, a template's background
+  -- or NineSlice, SetTabSelected); the stubs answer nil for those, as the client does where they are
+  -- missing. Nothing else may be read.
+  local PROBES = { "Button.GetDisabledTexture", "Button.GetHighlightTexture", "Button.GetNormalTexture", "Button.GetPushedTexture",
+    "Button.Icon", "Button.SetTabSelected", "CheckButton.GetDisabledCheckedTexture", "CheckButton.GetDisabledTexture",
+    "CheckButton.GetHighlightTexture", "CheckButton.GetNormalTexture", "CheckButton.GetPushedTexture", "Frame.Bg", "Frame.NineSlice",
+    "Frame.TitleText", "Slider.NineSlice" }
+  check(#T.unknownBut(PROBES) == 0, "no widget field read that the client lacks, but the style's probes" .. (#T.unknownBut(PROBES) > 0 and (": " .. table.concat(T.unknownBut(PROBES), ", ")) or ""))
+  local errs = skinErrors()
+  check(#errs == 0, "no skin errors (" .. table.concat(errs, "; ") .. ")")
+  check(#T.errors == 0, "no errors")
+`, pre || undefined);
+}
 
 scenario('themes: Blizzard puts the swing timer art round a bar design; Dark a flat panel and outline in its colors; texts in the style font', DISPLAY_HELPERS + String.raw`
   GameFontNormal = { GetFont = function() return "Fonts\\STYLE.TTF", 12, "" end } -- read by Dark's GetFont
@@ -4719,6 +5849,467 @@ scenario('displays: the first shot\'s wind-up is not a late shot: the ring and t
   check(label.text == "Late" and ShotWindowCallout.fontStrings[1].text == "Late", "a shot that is late: Late on both")
   check(#T.errors == 0, "no errors")
 `);
+
+// ---------------------------------------------------------------------------------------------
+// Words on the displays (Display tab): dispWords is the arc's label (Move, Stand still, Moving,
+// Late) and the ring's "Late", dispCount the ring's seconds. A pass runs one piece of a fight on the
+// real clock with the two settings given; a snapshot keeps every field of the regions a design
+// shows (a hidden one counts only as hidden), so two passes can be compared state by state.
+
+const WORDS_HELPERS = String.raw`
+  local WORDS, COUNT = "Words: Move, Stand still, Moving, Late", "Show the ring's countdown"
+  local FIELDS = { "shown", "alpha", "scale", "colorTex", "vertex", "file", "atlas", "texCoord", "points", "width", "height",
+    "startPoint", "endPoint", "thickness", "vertexOffsets", "layer", "sublevel", "fontSize", "fontFile", "gradient", "rotation" }
+  local FIELDSET = {}
+  for _, k in ipairs(FIELDS) do FIELDSET[k] = true end
+  -- A value laid out flat into out after its n-th entry: tables as their array part (and r, g, b, a
+  -- for a color) between braces, a widget (an anchor's frame) as itself; returns the new count. The
+  -- passes run at times that subtract exactly the same way (see pass), so equal states give equal lists.
+  local function walk(v, out, n)
+    if type(v) == "table" and getmetatable(v) == nil then
+      n = n + 1 out[n] = "{"
+      for i = 1, #v do n = walk(v[i], out, n) end
+      if v.r ~= nil then n = walk(v.r, out, n) n = walk(v.g, out, n) n = walk(v.b, out, n) n = walk(v.a, out, n) end
+      n = n + 1 out[n] = "}"
+    elseif v == nil then
+      n = n + 1 out[n] = "nil"
+    else
+      n = n + 1 out[n] = v
+    end
+    return n
+  end
+  -- A region's fields, each after its name, and its words (text and text color) apart. A hidden
+  -- region shows nothing, so only that it is hidden counts.
+  local HIDDEN = { "shown", false }
+  local function regionState(region)
+    if rawget(region, "shown") ~= true then return { region = region, body = HIDDEN, words = HIDDEN } end
+    local body, words, n = {}, {}, 0
+    for i = 1, #FIELDS do
+      local k = FIELDS[i]
+      n = n + 1 body[n] = k
+      n = walk(rawget(region, k), body, n)
+    end
+    walk(rawget(region, "textColor"), words, walk(rawget(region, "text"), words, 0))
+    return { region = region, body = body, words = words }
+  end
+  -- Everything a renderer shows for its design, region by region; also its frame, the frame drawn
+  -- round it and, on the live display, the late readout under it.
+  local function snapshot(r)
+    local list = {}
+    for i, region in ipairs(r.parts[r.design] or {}) do list[i] = regionState(region) end
+    local function add(region) if region then list[#list + 1] = regionState(region) end end
+    add(r.frame)
+    local c = r.chrome
+    if c then
+      add(c.bg) add(c.art)
+      for i = 1, 4 do add(c.edges[i]) end
+    end
+    local holder = rawget(_G, "ShotWindowDisplay")
+    if holder and rawget(r.frame, "parent") == holder then add(holder.fontStrings[2]) end
+    return list
+  end
+  -- A region's name in its renderer (for the messages).
+  local function nameOf(region)
+    for _, r in ipairs(T.renderers or {}) do
+      for name, t in pairs(r.tex) do if t == region then return name end end
+      for name, t in pairs(r.texts) do if t == region then return name end end
+      for name, sg in pairs(r.segs) do if sg.line == region or sg.tex == region then return name end end
+      if r.frame == region then return "(the renderer's frame)" end
+    end
+    return "(the frame round it, or the late readout)"
+  end
+  local function firstDiff(x, y)
+    for i = 1, math.max(#x, #y) do if x[i] ~= y[i] then return i end end
+  end
+  local function fieldAt(list, i)
+    for j = math.min(i, #list), 1, -1 do if FIELDSET[list[j]] then return list[j] end end
+    return "?"
+  end
+  -- How many regions differ between two snapshots, the words of the regions in skip (a set of
+  -- regions) left out, and the first few differences: "region field: a / b".
+  local function snapDiff(a, b, skip)
+    local out = {}
+    if #a ~= #b then out[1] = "region count " .. #a .. " / " .. #b end
+    for i = 1, math.min(#a, #b) do
+      local x, y = a[i], b[i]
+      if x.region ~= y.region then
+        out[#out + 1] = "region " .. i .. " is another region"
+      else
+        local d = firstDiff(x.body, y.body)
+        if d then
+          out[#out + 1] = nameOf(x.region) .. " " .. fieldAt(x.body, d) .. ": " .. tostring(x.body[d]) .. " / " .. tostring(y.body[d])
+        elseif not (skip and skip[x.region]) and firstDiff(x.words, y.words) then
+          d = firstDiff(x.words, y.words)
+          out[#out + 1] = nameOf(x.region) .. " words: " .. tostring(x.words[d]) .. " / " .. tostring(y.words[d])
+        end
+      end
+    end
+    local first = {}
+    for i = 1, math.min(4, #out) do first[i] = out[i] end
+    return #out, table.concat(first, "; ")
+  end
+  -- A font string that shows nothing: hidden, or empty.
+  local function blank(fs) return fs ~= nil and (not fs.shown or fs.text == nil or fs.text == "") end
+  local function fsStr(fs)
+    if not fs then return "no font string" end
+    local c = fs.color
+    return '"' .. tostring(fs.text) .. '"' .. (fs.shown and "" or " hidden") .. " in " .. rgbStr(c) .. " at alpha " .. num(c and c[4])
+  end
+`;
+
+// The live display through one piece of a fight per pass: the arc and the ring with each setting,
+// every other design with both on and both off. Blizzard art and Dark (flat), in seamless strips.
+for (const [mode, label] of [['art', 'Blizzard art'], ['dark', 'Dark style, flat']]) {
+  scenario('display words (' + label + '): both on by default: the arc says Move, Stand still, Moving and Late in its colors, the ring counts down and says Late; words off: the arc\'s label empty in every state, the ring 0.0 (pulsing) for a late shot; countdown off: the ring only says Late; both off: the ring blank; nothing else of either design changes, the arc ignores the countdown, and no other design changes at all', DISPLAY_HELPERS + WORDS_HELPERS + 'local MODE = "' + mode + '"\n' + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  if MODE == "dark" then ShotWindowDB = { style = "dark" } end
+  T.login(200)
+  if MODE == "dark" then T.fire("PLAYER_ENTERING_WORLD") end
+  local db = ShotWindowDB
+  check(MODE ~= "dark" or (NS.Styles.Applied() == "dark" and NS.Styles.S ~= nil), "Dark drawn")
+  check(db.dispWords == true and db.dispCount == true, "words and countdown on by default (" .. tostring(db.dispWords) .. ", " .. tostring(db.dispCount) .. ")")
+  local moveC = MODE == "dark" and { NS.Styles.S.GetAccentColor() } or db.moveColor
+  local WAIT_AT = 2.81 -- the update that finds the bar run out: the hold for the late shot starts
+  -- The piece of a fight: { state, seconds from the swing, event just before, when that event goes }.
+  local STATES = {
+    { "move", 1.0 },
+    { "stand still", 2.4 },
+    { "moving in the zone", 2.5, "PLAYER_STARTED_MOVING" },
+    { false, WAIT_AT },
+    { "late, still moving", 3.0 },
+    { "late", 3.25, "PLAYER_STOPPED_MOVING", 3.1 },
+    { "the shot", 3.4, "PLAYER_SWING" },
+    { "after the shot", 4.0 },
+  }
+  local LATE = { ["late, still moving"] = true, ["late"] = true }
+  local passes = 0
+  -- One pass with the two settings: per state, the snapshot, the word's font string (the arc's
+  -- label, the ring's count), the hold's age and how many regions are shown; nothing kept when
+  -- warming up (every region made before the passes compared). Every pass starts at a whole second
+  -- from 1024 to 2047, where doubles are equally spaced, so base + at - base comes out the same
+  -- in every pass and equal states draw equal numbers.
+  local function pass(D, words, count, warmUp)
+    passes = passes + 1
+    local base = 1024 + passes * 16
+    if base + 5 >= 2048 then check(false, "too many passes for the exact clock (" .. passes .. ")") end
+    db.dispWords, db.dispCount = words, count
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    local r = T.rend()
+    local out = {}
+    for _, st in ipairs(STATES) do
+      local name, at, ev, evAt = st[1], st[2], st[3], st[4]
+      if ev and evAt then T.now = base + evAt T.fire(ev) end
+      T.now = base + at
+      if ev and not evAt then
+        if ev == "PLAYER_SWING" then T.fire(ev, 2.8, 2) else T.fire(ev) end
+      end
+      T.update()
+      if name and not warmUp then
+        local fs = T.part(r, D == "ring" and "count" or "label")
+        out[#out + 1] = { name = name, snap = snapshot(r), shownParts = T.shownParts(r), age = T.now - (base + WAIT_AT),
+          fs = fs and { shown = T.isShown(fs), text = rawget(fs, "text"), color = rawget(fs, "textColor") } }
+      end
+    end
+    return out
+  end
+  local function compare(tag, want, got, skip)
+    for i, st in ipairs(got) do
+      local n, what = snapDiff(want[i].snap, st.snap, skip)
+      check(n == 0, tag .. st.name .. ": nothing else changes (" .. n .. " regions differ" .. (n > 0 and (": " .. what) or "") .. ")")
+    end
+  end
+  local function onOff(b) return b and "on" or "off" end
+
+  -- The arc.
+  T.slash("display arc")
+  pass("arc", true, true, true)
+  local r = T.rend()
+  check(r ~= nil and r.design == "arc" and r.mode == (MODE == "dark" and "flat" or "art") and r.quads == true,
+    "[arc] drawn " .. (MODE == "dark" and "flat" or "in the bar's art") .. " in seamless strips (" .. tostring(r and r.mode) .. ", quads " .. tostring(r and r.quads) .. ")")
+  local on = pass("arc", true, true)
+  -- The label with the words on: its text, its color, and whether it pulses (the hold for a late shot).
+  local WANT = {
+    ["move"] = { "Move", moveC }, ["stand still"] = { "Stand still", db.color }, ["moving in the zone"] = { "Moving", db.clipColor },
+    ["late, still moving"] = { "Moving", db.clipColor, true }, ["late"] = { "Late", db.color, true },
+    ["the shot"] = { "Move", moveC }, ["after the shot"] = { "Move", moveC },
+  }
+  for _, st in ipairs(on) do
+    local w, fs = WANT[st.name], st.fs
+    local a = w[3] and pulseAt(st.age) or 1
+    check(fs and fs.shown and fs.text == w[1] and sameRGB(fs.color, w[2]) and close(fs.color[4], a, 1e-6),
+      "[arc, words on] " .. st.name .. ': the label says "' .. w[1] .. '" in ' .. rgbStr(w[2]) .. " at alpha " .. num(a) .. " (" .. fsStr(fs) .. ")")
+  end
+  check(on[5].fs and on[5].fs.color and on[5].fs.color[4] < 0.5, "[arc, words on] late: the label pulses (alpha " .. num(on[5].fs and on[5].fs.color and on[5].fs.color[4]) .. ")")
+  local LABEL = { [T.part(r, "label")] = true }
+  local off = pass("arc", false, true)
+  for i, st in ipairs(off) do
+    check(blank(st.fs), "[arc, words off] " .. st.name .. ": the label is empty (" .. fsStr(st.fs) .. ")")
+    check(st.shownParts == on[i].shownParts and st.shownParts >= 20, "[arc, words off] " .. st.name
+      .. ": the arcs, fills, tint and top mark still drawn (" .. st.shownParts .. " regions shown, " .. on[i].shownParts .. " with the words)")
+  end
+  compare("[arc, words off] ", on, off, LABEL)
+  -- The countdown is the ring's alone: the arc ignores it, words on (the label too) or off.
+  compare("[arc, countdown off] ", on, pass("arc", true, false), nil)
+  local both = pass("arc", false, false)
+  for _, st in ipairs(both) do check(blank(st.fs), "[arc, both off] " .. st.name .. ": the label is empty (" .. fsStr(st.fs) .. ")") end
+  compare("[arc, both off] ", on, both, LABEL)
+
+  -- The ring.
+  T.slash("display ring")
+  pass("ring", true, true, true)
+  r = T.rend()
+  check(r ~= nil and r.design == "ring" and r.mode == (MODE == "dark" and "flat" or "art"), "[ring] drawn " .. (MODE == "dark" and "flat" or "in the bar's art")
+    .. " (" .. tostring(r and r.mode) .. ")")
+  local ringOn = pass("ring", true, true)
+  local SECS = { ["move"] = "1.8", ["stand still"] = "0.4", ["moving in the zone"] = "0.3", ["the shot"] = "2.8", ["after the shot"] = "2.2" }
+  local COLOR = { ["move"] = WHITE, ["stand still"] = db.color, ["moving in the zone"] = db.clipColor, ["late, still moving"] = db.clipColor,
+    ["late"] = db.color, ["the shot"] = WHITE, ["after the shot"] = WHITE }
+  -- What the ring says in a state: "Late" is a word, the seconds (0.0 while holding) the countdown.
+  local function ringWant(name, words, count)
+    if LATE[name] and words then return "Late" end
+    if not count then return "" end
+    return LATE[name] and "0.0" or SECS[name]
+  end
+  local COUNTFS = { [T.part(r, "count")] = true }
+  for _, combo in ipairs({ { true, true }, { false, true }, { true, false }, { false, false } }) do
+    local words, count = combo[1], combo[2]
+    local tag = "[ring, words " .. onOff(words) .. ", countdown " .. onOff(count) .. "] "
+    local run = (words and count) and ringOn or pass("ring", words, count)
+    for i, st in ipairs(run) do
+      local want, fs = ringWant(st.name, words, count), st.fs
+      if want == "" then
+        check(blank(fs), tag .. st.name .. ": blank (" .. fsStr(fs) .. ")")
+      else
+        local a = LATE[st.name] and pulseAt(st.age) or 1
+        check(fs and fs.shown and fs.text == want and sameRGB(fs.color, COLOR[st.name]) and close(fs.color[4], a, 1e-6),
+          tag .. st.name .. ': says "' .. want .. '" in ' .. rgbStr(COLOR[st.name]) .. " at alpha " .. num(a) .. " (" .. fsStr(fs) .. ")")
+      end
+      check(st.shownParts == ringOn[i].shownParts and st.shownParts >= 20, tag .. st.name .. ": the ring, its fill, tint and top mark still drawn ("
+        .. st.shownParts .. " regions shown, " .. ringOn[i].shownParts .. " with both on)")
+    end
+    if run ~= ringOn then compare(tag, ringOn, run, COUNTFS) end
+  end
+
+  -- Every other design: both settings off change nothing at all.
+  for _, D in ipairs(NS.DISPLAYS) do
+    if D ~= "none" and D ~= "arc" and D ~= "ring" then
+      T.slash("display " .. D)
+      pass(D, true, true, true)
+      compare("[" .. D .. ", words and countdown off] ", pass(D, true, true), pass(D, false, false), nil)
+    end
+  end
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks (" .. table.concat(T.unknownBut(), ", ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+}
+
+scenario('options: Show words and Show the ring\'s countdown sit in the Display page\'s right column under the line thickness, both checked; words usable for the arc and the ring, the countdown for the ring alone, following the Design button; a click saves it and the live display and the preview follow on the next frame; Defaults turns both back on; the Look note is gone and the accent checkbox, now last, still lies on the page above the Defaults row', DISPLAY_HELPERS + TAB_HELPERS + WORDS_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  T.slash("")
+  T.click(T.tab(2))
+  local db = ShotWindowDB
+  local page = T.pages()[2]
+  local words, count = T.checkbox(WORDS), T.checkbox(COUNT)
+  check(words ~= nil and count ~= nil and words:IsVisible() and count:IsVisible(), "both checkboxes shown on the Display tab")
+  if not (words and count) then return end
+  check(words.parent == page and count.parent == page, "both on the Display page")
+  check(words:GetChecked() == true and count:GetChecked() == true, "both checked by default")
+  -- Where a control sits on its page: x, and y down from the page's top.
+  local function leftOf(f) local p = f and f.points[1] return p and p[1] == "TOPLEFT" and type(p[2]) == "number" and p[2] or nil end
+  local function topOf(f) local p = f and f.points[1] return p and p[1] == "TOPLEFT" and type(p[3]) == "number" and -p[3] or nil end
+  local thick = T.slider("Line thickness of a round design").parent
+  local header
+  for _, fs in ipairs(page.fontStrings) do if rawget(fs, "text") == "Design options" then header = fs end end
+  check(leftOf(words) == 304 and leftOf(count) == 304, "in the right column (x " .. tostring(leftOf(words)) .. " and " .. tostring(leftOf(count)) .. ", want 304)")
+  local tY, wY, cY, hY = topOf(thick), topOf(words), topOf(count), topOf(header)
+  check(tY and wY and cY and hY and tY + thick.height <= wY and wY - tY <= 60 and cY == wY + 28 and cY + 24 <= hY,
+    "under the line thickness slider (at " .. tostring(tY) .. "), words (" .. tostring(wY) .. ") then the countdown ("
+    .. tostring(cY) .. "), then the Design options header (" .. tostring(hY) .. ")")
+
+  -- Usable as the Design button steps: words for the arc and the ring, the countdown for the ring.
+  local function u(on) return on and "usable" or "grayed" end
+  checkControls("none", { [WORDS] = "grayed", [COUNT] = "grayed" })
+  local design = buttonStarting("Design: ")
+  local stepped = {}
+  for i = 1, #NS.DISPLAYS do
+    T.click(design)
+    local d = db.display
+    stepped[#stepped + 1] = d
+    checkControls("Design button, " .. d, { [WORDS] = u(d == "arc" or d == "ring"), [COUNT] = u(d == "ring") })
+    check(words:GetChecked() == true and count:GetChecked() == true, d .. ": both still checked")
+  end
+  check(#stepped == #NS.DISPLAYS and db.display == "none", "the Design button went round every design (" .. table.concat(stepped, " ") .. ")")
+  T.click(design, "RightButton") -- reticle
+  checkControls("right click, " .. db.display, { [WORDS] = "grayed", [COUNT] = "grayed" })
+  T.click(design, "RightButton") -- ring
+  checkControls("right click, " .. db.display, { [WORDS] = "usable", [COUNT] = "usable" })
+  T.click(design, "RightButton") -- arc
+  checkControls("right click, " .. db.display, { [WORDS] = "usable", [COUNT] = "grayed" })
+  check(db.display == "arc", "the arc chosen (" .. tostring(db.display) .. ")")
+
+  local stage = T.preview()
+  local live = T.rend()
+  -- The preview's words over its whole made-up loop (9 s with a 2.8 s weapon), every 0.1 s: the
+  -- texts seen ("" for nothing shown), and the lowest alpha each was drawn at.
+  local function loopTexts(key)
+    local seen, low = {}, {}
+    for k = 1, 92 do
+      T.now = T.now + 0.1 T.update()
+      local fs = T.part(stage.renderer, key)
+      local t = (fs and T.isShown(fs)) and (rawget(fs, "text") or "") or ""
+      seen[t] = true
+      local c = fs and rawget(fs, "textColor")
+      if t ~= "" and c then low[t] = math.min(low[t] or 1, c[4] or 1) end
+    end
+    return seen, low
+  end
+  local function list(seen)
+    local l = {}
+    for k in pairs(seen) do l[#l + 1] = '"' .. k .. '"' end
+    table.sort(l)
+    return table.concat(l, " ")
+  end
+  local function numbers(seen) local n = 0 for k in pairs(seen) do if k:match("^%d+%.%d$") then n = n + 1 end end return n end
+  local function liveText(key) local fs = T.part(live, key) return fs and T.isShown(fs) and (rawget(fs, "text") or "") or "" end
+  local function previewText(key) local fs = T.part(stage.renderer, key) return fs and T.isShown(fs) and (rawget(fs, "text") or "") or "" end
+  local function nextFrame() T.now = T.now + 0.016 T.update() end
+
+  -- The arc, words on: the preview says all four.
+  local seen = loopTexts("label")
+  check(seen.Move and seen["Stand still"] and seen.Moving and seen.Late and not seen[""], "the preview's arc says Move, Stand still, Moving and Late (" .. list(seen) .. ")")
+  local t0 = T.now + 0.1
+  T.now = t0 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = t0 + 1 T.update()
+  check(liveText("label") == "Move" and previewText("label") ~= "", "before the click: the live arc says Move, the preview a word ("
+    .. liveText("label") .. ", " .. previewText("label") .. ")")
+  T.click(words)
+  check(db.dispWords == false and words:GetChecked() == false, "a click turns the words off (" .. tostring(db.dispWords) .. ")")
+  nextFrame()
+  check(liveText("label") == "" and previewText("label") == "", "the next frame: the live arc's label and the preview's empty ("
+    .. liveText("label") .. ", " .. previewText("label") .. ")")
+  seen = loopTexts("label")
+  check(list(seen) == '""', "the preview's arc shows no word over a whole loop (" .. list(seen) .. ")")
+  t0 = T.now + 0.1
+  T.now = t0 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = t0 + 1 T.update()
+  check(liveText("label") == "", "the live arc in a new swing: still no word (" .. liveText("label") .. ")")
+  T.click(words)
+  check(db.dispWords == true and words:GetChecked() == true, "a click turns the words on again")
+  nextFrame()
+  check(liveText("label") == "Move" and previewText("label") ~= "", "the next frame: Move on the live arc, a word in the preview ("
+    .. liveText("label") .. ", " .. previewText("label") .. ")")
+
+  -- The ring.
+  T.click(design)
+  check(db.display == "ring" and T.rend().design == "ring", "the Design button: the ring")
+  checkControls("ring", { [WORDS] = "usable", [COUNT] = "usable" })
+  local low
+  seen = loopTexts("count")
+  check(seen.Late and numbers(seen) >= 10 and not seen[""], "the preview's ring counts down and says Late (" .. numbers(seen) .. " different counts, " .. tostring(seen.Late) .. ")")
+  t0 = T.now + 0.1
+  T.now = t0 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = t0 + 1 T.update()
+  local before = previewText("count")
+  check(liveText("count") == "1.8" and before:match("^%d+%.%d$") ~= nil, "before the click: the live ring at 1.8, the preview counting ("
+    .. liveText("count") .. ", " .. before .. ")")
+  T.click(count)
+  check(db.dispCount == false and count:GetChecked() == false, "a click turns the countdown off")
+  nextFrame()
+  check(liveText("count") == "" and previewText("count") == "", "the next frame: the live ring and the preview blank ("
+    .. liveText("count") .. ", " .. previewText("count") .. ")")
+  seen = loopTexts("count")
+  check(list(seen) == '"" "Late"', "countdown off: the preview's ring only says Late (" .. list(seen) .. ")")
+  T.click(words)
+  check(db.dispWords == false and db.dispCount == false, "both off")
+  nextFrame()
+  check(liveText("count") == "", "both off: the live ring blank (" .. liveText("count") .. ")")
+  seen = loopTexts("count")
+  check(list(seen) == '""', "both off: the preview's ring blank over a whole loop (" .. list(seen) .. ")")
+  T.click(count)
+  check(db.dispWords == false and db.dispCount == true, "the countdown on again, words off")
+  t0 = T.now + 0.1
+  T.now = t0 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = t0 + 1 T.update()
+  check(liveText("count") == "1.8", "words off: the live ring counts (" .. liveText("count") .. ")")
+  seen, low = loopTexts("count")
+  check(seen["0.0"] and not seen.Late and not seen[""] and numbers(seen) >= 10, "words off: the preview's ring counts down to 0.0, never Late (" .. list(seen) .. ")")
+  check(low["0.0"] and low["0.0"] < 0.5, "and pulses at 0.0 while holding (lowest alpha " .. num(low["0.0"]) .. ")")
+
+  -- Defaults turns both back on.
+  T.click(count)
+  check(db.dispWords == false and db.dispCount == false, "both off before Defaults")
+  T.click(T.button("Defaults"))
+  check(db.dispWords == true and db.dispCount == true, "Defaults: both on (" .. tostring(db.dispWords) .. ", " .. tostring(db.dispCount) .. ")")
+  check(words:GetChecked() == true and count:GetChecked() == true, "Defaults: both checked")
+  checkControls("Defaults (none)", { [WORDS] = "grayed", [COUNT] = "grayed" })
+
+  -- The Look note is gone; the accent checkbox is the last control and still lies on the page.
+  local notes = {}
+  for _, f in ipairs({ T.content(), table.unpack(T.pages()) }) do
+    for _, fs in ipairs(f.fontStrings) do
+      local t = rawget(fs, "text")
+      if type(t) == "string" and (t:find("^Look: ") or t:find("styles the displays too", 1, true)) then notes[#notes + 1] = t end
+    end
+  end
+  check(#notes == 0, "no Look note on any page (" .. table.concat(notes, " | ") .. ")")
+  local accent = T.checkbox("Use the window style's accent for move")
+  local aY = topOf(accent)
+  local reset = T.button("Defaults")
+  local rp = reset.points[1]
+  local resetTop = CONTENT_H - rp[3] - reset.height
+  check(accent and accent.parent == page and leftOf(accent) == 304 and aY and aY + accent.height <= PAGE_H and PAGE_TOP + aY + accent.height < resetTop,
+    "the accent checkbox on the page (" .. tostring(aY) .. " to " .. tostring(aY and aY + accent.height) .. " of " .. PAGE_H
+    .. "), above the Defaults row (at " .. resetTop .. ", the checkbox ends at " .. tostring(aY and PAGE_TOP + aY + accent.height) .. ")")
+  local lowest, what = 0, "nothing"
+  local function low2(name, x, y, h) if x and y and x >= 300 and y + h > lowest then lowest, what = y + h, name end end
+  for _, f in ipairs(page.children) do low2(f.kind .. " " .. tostring(rawget(f, "text") or ""), leftOf(f), topOf(f), f.height or 0) end
+  for _, fs in ipairs(page.fontStrings) do low2("text " .. tostring(rawget(fs, "text")), leftOf(fs), topOf(fs), 14) end
+  check(aY and lowest == aY + accent.height, "the accent checkbox is the right column's last control (the lowest: " .. what .. ", ending at " .. lowest .. ")")
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks (" .. table.concat(T.unknownBut(), ", ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('options: the accent checkbox is usable only under a drawn style; under Dark it grays the Move color while on', DISPLAY_HELPERS + 'ShotWindowDB = { style = "dark" }\n' + String.raw`
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.Styles.S ~= nil, "Dark drawn")
+  T.slash("")
+  T.click(T.tab(2))
+  local db = ShotWindowDB
+  checkControls("Dark, accent on", { ["Use the window style's accent for move"] = "usable", ["Move color"] = "grayed" })
+  T.click(T.checkbox("Use the window style's accent for move"))
+  check(db.moveAccent == false, "a click turns the accent off")
+  checkControls("Dark, accent off", { ["Use the window style's accent for move"] = "usable", ["Move color"] = "usable" })
+  check(#T.errors == 0, "no errors")
+`);
+
+// Saved settings from a version without the words options, and a saved choice.
+for (const [saved, label] of [['{ display = "arc", window = 0.5, moveAccent = true, dispThick = 12 }', 'neither key: both on'],
+  ['{ display = "arc", dispWords = false, dispCount = false }', 'both saved off: kept off']]) {
+  scenario('display words, saved settings (' + label + ')', DISPLAY_HELPERS + WORDS_HELPERS + 'ShotWindowDB = ' + saved + '\n' + String.raw`
+  local OLD = ShotWindowDB.dispWords == nil
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  check(db.dispWords == OLD and db.dispCount == OLD, "after login: words " .. tostring(db.dispWords) .. ", countdown " .. tostring(db.dispCount) .. ", want " .. tostring(OLD))
+  check(db.display == "arc" and db.dispThick == 12, "the rest of the saved settings kept")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  local label = T.part(T.rend(), "label")
+  check(label ~= nil and (OLD and label.text == "Move" or (not OLD and blank({ shown = label.shown, text = label.text }))),
+    "the arc " .. (OLD and "says Move" or "shows no word") .. " (" .. tostring(label and label.text) .. ")")
+  T.slash("display ring")
+  T.now = 101.1 T.update()
+  local fs = T.part(T.rend(), "count")
+  check(fs ~= nil and (OLD and fs.text == "1.7" or (not OLD and blank({ shown = fs.shown, text = fs.text }))),
+    "the ring " .. (OLD and "counts" or "is blank") .. " (" .. tostring(fs and fs.text) .. ")")
+  T.slash("")
+  T.click(T.tab(2))
+  check(T.checkbox(WORDS):GetChecked() == OLD and T.checkbox(COUNT):GetChecked() == OLD, "the checkboxes show it")
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks (" .. table.concat(T.unknownBut(), ", ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+}
 
 scenario('displays: a saved design this version does not know counts as none; the options still work', DISPLAY_HELPERS + String.raw`
   T.autoRepMode, T.autoRep[75] = "plain", true
@@ -5309,7 +6900,7 @@ scenario('Blizzard art (Line strips): /shotwindow flipart swaps the top and bott
   T.slash("display ring")
   T.slash("")
   T.click(T.tab(2))
-  local pr = T.preview(T.pages()[2]).renderer
+  local pr = T.preview().renderer
   local function previewStatic(flip, label)
     local g = artGeom("ring", pr.w, pr.h, db.dispThick, 0)
     check(pr.design == "ring" and pr.mode == "art", "[ring] preview " .. label .. ": in the bar's art")
@@ -5395,9 +6986,9 @@ scenario('Blizzard art (Line strips): the preview in the options wears the same 
   local db = ShotWindowDB
   T.slash("")
   T.click(T.tab(2))
-  local box = T.preview(T.pages()[2])
+  local box = T.preview()
   local pr = box and box.renderer
-  check(pr ~= nil, "a preview on the Display page")
+  check(pr ~= nil and box:IsVisible(), "the preview over the tabs, on the Display tab too")
   -- The ring again last: the reticle is the same size, so the preview is not resized on the way
   -- back and only the design change can bring its strips back.
   for index, D in ipairs({ "arc", "ring", "reticle", "ring" }) do
@@ -6051,7 +7642,7 @@ scenario('Seamless strips (Blizzard art): the arc, the ring and the reticle thro
   T.slash("display ring")
   T.slash("")
   T.click(T.tab(2))
-  local pr = T.preview(T.pages()[2]).renderer
+  local pr = T.preview().renderer
   T.now = 300 T.update() T.now = 300.1 T.update()
   local function previewStatic(label)
     check(pr.design == "ring" and pr.mode == "art" and pr.quads == true, "[ring] preview " .. label .. ": in the bar's art, seamless strips")

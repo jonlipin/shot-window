@@ -793,7 +793,7 @@ function Draw.arc(r, v, db)
 	StyleFont(label, r.look, math.max(10, math.floor(rad * 0.28)))
 	label:ClearAllPoints()
 	label:SetPoint("CENTER", r.frame, "BOTTOMLEFT", cx, cy + rad * 0.15)
-	if v.idle then
+	if v.idle or db.dispWords == false then -- the words can be turned off (Display tab)
 		label:SetText("")
 	else
 		local c = v.lit and v.zone or v.move
@@ -825,10 +825,12 @@ function Draw.ring(r, v, db)
 	StyleFont(count, r.look, math.max(10, math.floor(rad * 0.45)))
 	count:ClearAllPoints()
 	count:SetPoint("CENTER", r.frame, "BOTTOMLEFT", cx, cy)
-	if v.idle or not v.remaining then
+	-- "Late" is one of the words, the seconds are the countdown; each can be turned off (Display tab).
+	local word = v.lateShot and db.dispWords ~= false
+	if v.idle or not v.remaining or not (word or db.dispCount ~= false) then
 		count:SetText("")
 	else
-		count:SetText(v.lateShot and "Late" or ("%.1f"):format(v.remaining))
+		count:SetText(word and "Late" or ("%.1f"):format(v.remaining))
 		local c = v.lit and v.zone or WHITE
 		count:SetTextColor(c[1], c[2], c[3], v.late and v.pulse or 1)
 	end
@@ -1225,7 +1227,8 @@ function ns.DisplayReport()
 end
 
 ---------------------------------------------------------------------------
--- The preview in the options: the chosen design on a made-up swing loop
+-- The preview in the options: the game's bar with the zone on it as the Zone tab sets it, and the
+-- chosen display, on a made-up swing loop
 ---------------------------------------------------------------------------
 
 -- Three shots: an ordinary one; one where the player moves into the wind-up (clipping) so the shot
@@ -1261,66 +1264,283 @@ function ns.Simulate(s, now, start, dur, lead)
 	return s
 end
 
+-- The game's ranged bar as Blizzard_SwingTimer.xml builds it: the background and frame atlases over
+-- the whole frame, the fill inside it 5 in from the sides and 4 from the top and bottom, the pip on
+-- the fill's end, the bar's name on the left over a shadow, and the time left on the right.
+local BAR_W, BAR_H = 240, 30
+local BAR_PIP, BAR_SHADOW = "ui-swingtimerbar-pip", "ui-swingtimerbar-textshadow-left"
+
+local function NewGameBar(parent)
+	local g = {}
+	local f = CreateFrame("Frame", nil, parent)
+	f:SetSize(BAR_W, BAR_H)
+	g.frame = f
+	g.bg = f:CreateTexture(nil, "BACKGROUND", nil, 0)
+	g.bg:SetAllPoints()
+	g.border = f:CreateTexture(nil, "BACKGROUND", nil, 1)
+	g.border:SetAllPoints()
+	local sb = CreateFrame("Frame", nil, f)
+	sb:SetPoint("TOPLEFT", 5, -4)
+	sb:SetPoint("BOTTOMRIGHT", -5, 4)
+	g.sb, g.sw = sb, BAR_W - 10
+	g.track = sb:CreateTexture(nil, "BACKGROUND", nil, -8) -- the flat looks' track, as the real bars get
+	g.track:SetAllPoints()
+	g.edges = Edges(sb, "BACKGROUND")
+	g.fill = sb:CreateTexture(nil, "ARTWORK", nil, 0)
+	g.fill:SetPoint("TOPLEFT")
+	g.fill:SetPoint("BOTTOMLEFT")
+	-- Shot Window's marks, on the same layers as on the real bar.
+	g.tint = sb:CreateTexture(nil, "ARTWORK", nil, 5)
+	g.tint:SetAllPoints(g.fill)
+	g.stand = sb:CreateTexture(nil, "ARTWORK", nil, 6)
+	g.line = sb:CreateTexture(nil, "ARTWORK", nil, 7)
+	g.pip = sb:CreateTexture(nil, "OVERLAY", nil, 0)
+	g.pip:SetPoint("RIGHT", g.fill, "RIGHT", 0, 0)
+	g.shadow = sb:CreateTexture(nil, "OVERLAY", nil, -1)
+	g.shadow:SetPoint("TOPLEFT")
+	g.shadow:SetPoint("BOTTOMLEFT")
+	g.shadow:SetWidth(171)
+	g.typeFS = sb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	g.typeFS:SetPoint("LEFT", 10, 0)
+	g.typeFS:SetText(SWING_TIMER_RANGED or "Ranged")
+	g.timeFS = sb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	g.timeFS:SetPoint("RIGHT", -10, 0)
+	g.late = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall") -- "+0.42", as on the real bar
+	g.late:SetPoint("BOTTOMRIGHT", sb, "TOPRIGHT", 0, 2)
+	return g
+end
+
+-- The bar in the window style's look: Blizzard's own art, or flat in the style's colors with the
+-- accent fill, as ShotWindow_Skins.lua's FlatBar draws the real bars (it leaves the text shadow
+-- and hands the labels to the style's Font). Without the art, flat too. Painted again whenever the
+-- style's colors or font change (EllesmereUI can change them live).
+local function LookKey(look)
+	local t, a = look.track, look.accent
+	return look.name .. ":" .. tostring(look.flat) .. ":" .. t[1] .. "," .. t[2] .. "," .. t[3]
+		.. ":" .. (a and (a[1] .. "," .. a[2] .. "," .. a[3]) or "") .. ":" .. tostring(look.font)
+end
+
+local function PaintGameBar(g, look)
+	local key = LookKey(look)
+	if g.lookKey == key then return end
+	g.lookKey = key
+	local slices = not look.flat and ArtSlices()
+	local art = slices and pcall(g.bg.SetAtlas, g.bg, ART.bg) and pcall(g.border.SetAtlas, g.border, ART.frame)
+		and pcall(g.fill.SetAtlas, g.fill, ART.fill)
+	g.art = art and slices.fill or nil
+	g.pipOK = art and pcall(g.pip.SetAtlas, g.pip, BAR_PIP, true) or false
+	local shadow = (art or look.flat) and pcall(g.shadow.SetAtlas, g.shadow, BAR_SHADOW)
+	g.bg:SetShown(art and true or false)
+	g.border:SetShown(art and true or false)
+	g.shadow:SetShown(shadow and true or false)
+	g.track:SetShown(not art)
+	if art then
+		g.fill:SetVertexColor(1, 1, 1, 1)
+		for i = 1, 4 do g.edges[i]:Hide() end
+	else
+		local t, a = look.track, look.accent or { 0.85, 0.62, 0.2 }
+		g.track:SetColorTexture(t[1], t[2], t[3], look.flat and 0.85 or 0.7)
+		g.fill:SetColorTexture(a[1], a[2], a[3], 1)
+		PlaceEdges(g.edges, g.sb, 1, look.flat and { 0, 0, 0, 1 } or { 0.8, 0.65, 0.3, 0.9 })
+	end
+	for _, fs in ipairs({ g.typeFS, g.timeFS }) do
+		if GameFontHighlightSmall then fs:SetFontObject(GameFontHighlightSmall) end
+		local S = look.flat and ns.Styles and ns.Styles.S
+		if S and S.Font then pcall(S.Font, fs) end
+	end
+end
+
+-- One frame of the bar, as the game and Shot Window draw it for this state.
+local function DrawGameBar(g, s, db, look, lateHere)
+	PaintGameBar(g, look)
+	local dur, sw = s.dur, g.sw
+	-- The fill runs with the swing; the game empties its bar the moment the time is up, late or not.
+	local p = (s.t and dur > 0) and clamp(s.t / dur, 0, 1) or 0
+	if p > 0 then
+		g.fill:SetWidth(math.max(1, sw * p))
+		if g.art then
+			local a = g.art
+			g.fill:SetTexCoord(a.l, a.l + (a.r - a.l) * p, a.t, a.b) -- revealed, as a status bar does
+		end
+		g.fill:Show()
+		g.pip:SetShown(g.pipOK)
+	else
+		g.fill:Hide()
+		g.pip:Hide()
+	end
+	g.timeFS:SetText(("%.1f"):format(s.t and math.max(0, dur - s.t) or 0))
+	-- The zone: from the lead before the end to the end, lit while the swing is inside it.
+	local from = math.max(0, dur - (s.lead or 0))
+	local x = (dur > 0 and from < dur) and from / dur * sw or nil
+	local c = s.clipping and db.clipColor or db.color
+	local a = (s.lit and db.flash) and db.activeAlpha or db.idleAlpha
+	local pulse = 1
+	if s.waiting and db.pulse and (s.waitAge or 0) >= WAIT_GRACE then
+		pulse = 0.6 + 0.4 * math.cos(((s.waitAge or 0) - WAIT_GRACE) * math.pi * 2.5)
+	end
+	if db.band and x then
+		local t = g.stand
+		t:ClearAllPoints()
+		t:SetPoint("TOPLEFT", g.sb, "TOPLEFT", x, 0)
+		t:SetPoint("BOTTOMLEFT", g.sb, "BOTTOMLEFT", x, 0)
+		t:SetWidth(math.max(1, sw - x))
+		t:SetColorTexture(c[1], c[2], c[3], a)
+		t:SetAlpha(pulse)
+		t:Show()
+	else
+		g.stand:Hide()
+	end
+	if db.line and x and x > 0 then
+		local l, lc = g.line, db.lineColor
+		l:ClearAllPoints()
+		l:SetPoint("TOP", g.sb, "TOPLEFT", x, 0)
+		l:SetPoint("BOTTOM", g.sb, "BOTTOMLEFT", x, 0)
+		l:SetWidth(db.lineWidth or 2)
+		l:SetColorTexture(lc[1], lc[2], lc[3], 0.95)
+		l:Show()
+	else
+		g.line:Hide()
+	end
+	if s.lit and db.fillTint and p > 0 then
+		local f = s.clipping and db.clipColor or db.fillColor
+		g.tint:SetColorTexture(f[1], f[2], f[3], db.fillAlpha)
+		g.tint:Show()
+	else
+		g.tint:Hide()
+	end
+	if lateHere and db.lateText and s.lateBy then
+		local cc = db.clipColor
+		g.late:SetText(("+%.2f"):format(s.lateBy))
+		g.late:SetTextColor(cc[1], cc[2], cc[3])
+		g.late:Show()
+	else
+		g.late:Hide()
+	end
+end
+
+-- The preview fills its parent (width x height), in rows that never overlap: the two names on top,
+-- the call-out under them, the drawing, and room under the drawing for a display's late readout.
+-- The game's bar sits in the middle with no display, on the left with one beside it, and under it
+-- when the display sits on the bar. A small copy of the screen edge tint runs round the inside.
+local NAMES_ROW, CALLOUT_ROW, LATE_ROW = 18, 22, 14
+local CALLOUT_MAX = 20 -- the call-out's size in the preview, at most
+
 function ns.NewPreview(parent, width, height)
-	local box = CreateFrame("Frame", nil, parent)
-	box:SetSize(width, height)
-	local bg = box:CreateTexture(nil, "BACKGROUND", nil, -8)
-	bg:SetAllPoints()
-	bg:SetColorTexture(0, 0, 0, 0.35)
-	local bands = EdgeBands(box, 14) -- the screen edge, in miniature
-	local edgeKeyP
-	local stage = CreateFrame("Frame", nil, box)
+	local stage = CreateFrame("Frame", nil, parent)
 	stage:SetAllPoints()
-	local r = ns.NewRenderer(stage)
-	r.frame:SetPoint("CENTER", 0, -6)
-	local say = stage:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-	say:SetPoint("TOP", 0, -6)
-	local late = stage:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	late:SetPoint("BOTTOMRIGHT", -6, 6)
+	local bands = EdgeBands(stage, 12)
+	for _, band in ipairs(bands) do band.tex:Hide() end
+	local edgeKeyP
+	local g = NewGameBar(stage)
+	local cell = CreateFrame("Frame", nil, stage) -- the display, over the bar when it sits on it
+	cell:SetAllPoints()
+	cell:SetFrameLevel(g.frame:GetFrameLevel() + 5)
+	local r = ns.NewRenderer(cell)
+	-- The display hangs from an unscaled slot with no offsets: the client reads anchor offsets in
+	-- the anchored frame's own scale, so a display shrunk to fit would drift if placed by offsets.
+	local slot = CreateFrame("Frame", nil, cell)
+	slot:SetSize(1, 1)
+	r.frame:SetPoint("CENTER", slot, "CENTER")
+	local top = CreateFrame("Frame", nil, stage) -- the words, over everything
+	top:SetAllPoints()
+	top:SetFrameLevel(cell:GetFrameLevel() + 5)
+	local say = top:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	local late = top:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	late:SetPoint("TOPRIGHT", r.frame, "BOTTOMRIGHT", 0, -2)
+	local barName = top:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	barName:SetPoint("TOPLEFT", 8, -5)
+	barName:SetText("The game's swing bar")
+	local dispName = top:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	dispName:SetPoint("TOPRIGHT", -8, -5)
+	dispName:SetJustifyH("RIGHT")
+	local drawTop = NAMES_ROW + CALLOUT_ROW
+	local fitH = height - drawTop - LATE_ROW
+	local midY = -(drawTop + fitH / 2)
+	local placed, fitW, dispX, barX
 	local s, start = {}, nil
-	box.renderer = r
-	box:SetScript("OnUpdate", function()
+	stage.renderer, stage.bar, stage.say, stage.late, stage.dispName, stage.slot = r, g, say, late, dispName, slot
+
+	local function Place(chosen, onBar)
+		local key = chosen .. (onBar and ":bar" or "")
+		if key == placed then return end
+		placed = key
+		if chosen == "none" or onBar then
+			barX, dispX, fitW = width / 2, width / 2, width - 24
+		else
+			barX, dispX, fitW = width / 4, width * 3 / 4, width / 2 - 24
+		end
+		g.frame:ClearAllPoints()
+		g.frame:SetPoint("CENTER", stage, "TOPLEFT", barX, midY)
+		slot:ClearAllPoints()
+		slot:SetPoint("CENTER", cell, "TOPLEFT", dispX, midY)
+		say:ClearAllPoints()
+		say:SetPoint("TOP", stage, "TOPLEFT", chosen == "none" and barX or dispX, -NAMES_ROW)
+		local name = NAMES[chosen] or chosen
+		if chosen == "none" then
+			dispName:SetText("No display of its own")
+		elseif onBar then
+			dispName:SetText("Display: " .. name .. ", on the bar")
+		else
+			dispName:SetText("Display: " .. name)
+		end
+	end
+
+	stage:SetScript("OnUpdate", function()
 		local db = ns.DB()
 		if not db then return end
-		local chosen = db.display or "none"
-		local design = chosen == "none" and "classic" or chosen
-		r:SetDesign(design)
-		local w, h = ns.DisplaySize(db, design)
-		if chosen == "none" then w, h = 200, 14 end -- the game bar's shape
-		if w ~= r.w or h ~= r.h then r:SetSize(w, h) end
-		local fit = math.min(1, (width - 20) / w, (height - 50) / h)
-		if math.abs(r.frame:GetScale() - fit) > 0.001 then r.frame:SetScale(fit) end
+		local look = Look()
 		local now = GetTime()
 		start = start or now
 		local dur = (ns.WeaponSpeed and ns.WeaponSpeed()) or 2.8
 		local lead = math.min(ns.Lead and ns.Lead() or 0.5, dur)
 		ns.Simulate(s, now, start, dur, lead)
 		if not db.warnMove then s.clipping = false end
-		r:Draw(s, db)
+		if not db.hold then
+			-- Nothing holds the zone: the bar just ends, and nothing measures how late the shot was.
+			if s.waiting then s.waiting, s.waitAge, s.waitKind, s.lit = false, nil, nil, false end
+			s.lateBy = nil
+		end
+		local chosen = db.display or "none"
+		if not NAMES[chosen] then chosen = "none" end
+		Place(chosen, chosen ~= "none" and db.dispOnBar and true or false)
+		DrawGameBar(g, s, db, look, chosen == "none")
+		if chosen ~= "none" then
+			r:SetDesign(chosen)
+			local w, h = ns.DisplaySize(db, chosen)
+			if w ~= r.w or h ~= r.h then r:SetSize(w, h) end
+			local fit = math.min(1, fitW / w, fitH / h)
+			if math.abs(r.frame:GetScale() - fit) > 0.001 then r.frame:SetScale(fit) end
+			cell:Show()
+			r:Draw(s, db)
+			if db.lateText and s.lateBy then
+				local cc = db.clipColor
+				late:SetText(("+%.2f"):format(s.lateBy))
+				late:SetTextColor(cc[1], cc[2], cc[3])
+				late:Show()
+			else
+				late:Hide()
+			end
+		else
+			cell:Hide()
+			late:Hide()
+		end
 		local text, c, a = CalloutText(s, db)
 		if db.callout and text then
+			SetBigFont(say, math.min(db.calloutSize or 26, CALLOUT_MAX))
 			say:SetText(text)
 			say:SetTextColor(c[1], c[2], c[3], a)
 			say:Show()
 		else
 			say:Hide()
 		end
-		if db.lateText and s.lateBy then
-			late:SetText(("+%.2f"):format(s.lateBy))
-			local cc = db.clipColor
-			late:SetTextColor(cc[1], cc[2], cc[3])
-			late:Show()
-		else
-			late:Hide()
-		end
 		local ec, ea = EdgeState(s, db)
 		if db.edge and ec then
 			local key = ec[1] .. ":" .. ec[2] .. ":" .. ec[3]
-			if key ~= edgeKeyP then PaintEdge(bands, ec, 14) edgeKeyP = key end
+			if key ~= edgeKeyP then PaintEdge(bands, ec, 12) edgeKeyP = key end
 			for _, band in ipairs(bands) do band.tex:SetAlpha(ea) band.tex:Show() end
 		else
 			for _, band in ipairs(bands) do band.tex:Hide() end
 		end
 	end)
-	return box
+	return stage
 end

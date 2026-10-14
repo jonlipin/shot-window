@@ -161,7 +161,22 @@ function ns.SkinContent(c)
 	Try("options text", function()
 		for _, fs in ipairs(parts.texts) do Fonts(fs) end
 	end)
+	-- The preview keeps a box of its own, a darker panel, with the tabs under it (as Conjurer's).
+	Try("options tabs", function()
+		if c.previewBox and S().Panel then S().Panel(c.previewBox, { inset = true }) end
+		for _, tab in ipairs(parts.tabs or {}) do
+			if S().Tab then S().Tab(tab) end
+		end
+		c.swSkinned = true
+		if c.swTab then ns.SkinTabSelection(c, c.swTab) end
+	end)
 	Try("accent", Accent)
+end
+
+-- The tab on view in the window's copy, as Shot Window picks it.
+function ns.SkinTabSelection(c, index)
+	if not S() or not c.swSkinned or not S().SetTabSelection then return end
+	for i, tab in ipairs(c.tabs or {}) do S().SetTabSelection(tab, i == index) end
 end
 
 -- Everything that exists when a style is applied: the window, if it was opened before. If it is

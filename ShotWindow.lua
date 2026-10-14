@@ -66,6 +66,8 @@ local DEFAULTS = {
 	scanMode = "pingpong", -- the scanner's spark: "pingpong" (out and back) or "wrap" (left to right)
 	trackSeconds = 5,      -- seconds the rhythm track shows
 	pipCount = 11,
+	dispWords = true,      -- words on a display: the arc's Move, Stand still, Moving and Late, the ring's Late
+	dispCount = true,      -- the ring's countdown
 	-- Look of the options window (Styles.lua)
 	style = "auto",  -- "auto" (EllesmereUI when it is running), "blizzard" or "dark"
 	darkAlpha = 0.92, -- background opacity of the Dark style
@@ -462,9 +464,22 @@ local content, window, settingsPage, settingsCategory
 local windowContent -- the window's own copy of the controls, made while a style is drawn
 local nativeOpenFailed, toldToClose = false, false
 local optionsReport = {} -- printed by /shotwindow debug
-local TAB_H = 30 -- the row of tabs above the pages
-local W, CONTENT_H = 600, 532 + TAB_H
-local PAGE_H = CONTENT_H - TAB_H
+-- From the top: the preview across the whole width, the tabs hanging under it the way Conjurer's
+-- hang under its Water and Food box, the open tab's page, and the Defaults row. 581 high fits the
+-- game's Options page (about 600 under its title) without scaling down.
+local W = 600
+local PREVIEW_H = 132
+local TAB_H, TAB_W, TAB_X, TAB_GAP, TAB_TUCK = 32, 120, 8, 3, 1
+local PAGE_TOP = PREVIEW_H - TAB_TUCK + TAB_H + 6
+local PAGE_H = 384
+local CONTENT_H = PAGE_TOP + PAGE_H + 28
+local SHORT_H = 210 -- a class with no shot: a few lines, the Look section and the Defaults row
+local TABS = {
+	{ "Zone", "The stand-still zone on the game's swing bar: its timing, the red zone, the marker line and the fill." },
+	{ "Display", "A display of its own besides the game's bar: the design, where it sits and its size." },
+	{ "Alerts", "Moving in the zone, late shots, call-out text, the screen edge and a sound." },
+	{ "Look", "The window style: Blizzard, Dark or EllesmereUI, for this window, the swing bars and the displays." },
+}
 local currentTab = 1
 local COL, LEFT, RIGHT = 290, 8, 304
 local sliderCount = 0
@@ -551,7 +566,7 @@ local function OptionCheck(parent, label, key, x, y, enabled)
 		cb:SetChecked(db[key] and true or false)
 		if enabled then SetUsable(cb, enabled()) end
 	end
-	return y - 28
+	return y - 28, cb
 end
 
 -- Sliders run in whole numbers (milliseconds, percent) to avoid float noise. get() gives the
@@ -811,19 +826,6 @@ local function Step(list, current, step)
 	return list[(index - 1 + step) % #list + 1]
 end
 
-local function Preview(parent, x, y)
-	if not ns.NewPreview then return y end
-	local box = ns.NewPreview(parent, COL - 20, 150)
-	box:SetPoint("TOPLEFT", x + 4, y)
-	local caption = parent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	caption:SetPoint("TOPLEFT", x + 4, y - 154)
-	caption:SetWidth(COL - 20)
-	caption:SetJustifyH("LEFT")
-	caption:SetText("A made-up loop: an ordinary shot, one you move into (clipping, so it comes late and the display holds), then one more.")
-	Keep(parent, "texts", caption)
-	return y - 186
-end
-
 local function Design() return db.display or "none" end
 local function HasDisplay() return Design() ~= "none" end
 local function IsRound() return ns.ROUND_DISPLAYS and ns.ROUND_DISPLAYS[Design()] or false end
@@ -851,19 +853,30 @@ local function BuildDisplayPage(p)
 	y = OptionSlider(p, "Length", LEFT, y, 80, 600, 10,
 		function() return db.dispWidth end, function(v) db.dispWidth = v end,
 		function(v) return v .. " px" end, Straight)
-	y = OptionSlider(p, "Thickness of a bar", LEFT, y, 4, 60, 1,
+	OptionSlider(p, "Thickness of a bar", LEFT, y, 4, 60, 1,
 		function() return db.dispHeight end, function(v) db.dispHeight = v end,
 		function(v) return v .. " px" end, Straight)
-	y = OptionSlider(p, "Size of a round design", LEFT, y, 60, 400, 5,
+
+	y = Header(p, "Round designs", RIGHT, -4)
+	y = OptionSlider(p, "Size of a round design", RIGHT, y, 60, 400, 5,
 		function() return db.dispSize end, function(v) db.dispSize = v end,
 		function(v) return v .. " px" end, Round)
-	OptionSlider(p, "Line thickness of a round design", LEFT, y, 2, 30, 1,
+	y = OptionSlider(p, "Line thickness of a round design", RIGHT, y, 2, 30, 1,
 		function() return db.dispThick end, function(v) db.dispThick = v end,
 		function(v) return v .. " px" end, Round)
-
-	y = Header(p, "Preview", RIGHT, -4)
-	y = Preview(p, RIGHT, y)
-	y = Header(p, "Design options", RIGHT, y)
+	local words, count
+	y, words = OptionCheck(p, "Words: Move, Stand still, Moving, Late", "dispWords", RIGHT, y,
+		function() return Design() == "arc" or Design() == "ring" end)
+	Tooltip(words, "Words on the display", function()
+		return { { "The horseshoe's Move, Stand still, Moving and Late, and the ring's Late." },
+			{ "The big call-out (Stop, Moving, Late, Go) has its own switch on the Alerts tab.", 0.8, 0.8, 0.8 } }
+	end)
+	y, count = OptionCheck(p, "Show the ring's countdown", "dispCount", RIGHT, y, function() return Design() == "ring" end)
+	Tooltip(count, "The ring's countdown", function()
+		return { { "The seconds left, in the middle of the ring." },
+			{ "While a late shot is held it says Late, or stays at 0.0 with the words off.", 0.8, 0.8, 0.8 } }
+	end)
+	y = Header(p, "Design options", RIGHT, y - 4)
 	y = OptionCycle(p, RIGHT, y, 260, function()
 		return "Scanner: " .. (db.scanMode == "wrap" and "left to right" or "out and back")
 	end, function()
@@ -871,19 +884,15 @@ local function BuildDisplayPage(p)
 	end, function() return Design() == "scanner" end, { "Scanner sweep",
 		"Out and back: the spark crosses the shot line at each shot and turns at the ends.",
 		"Left to right: the spark always crosses from left to right and wraps round." })
-	y = OptionSlider(p, "Rhythm track: seconds shown", RIGHT, y - 4, 2, 12, 1,
+	y = OptionSlider(p, "Rhythm track: seconds shown", RIGHT, y, 2, 12, 1,
 		function() return db.trackSeconds end, function(v) db.trackSeconds = v end,
 		function(v) return v .. " s" end, function() return Design() == "track" end)
 	y = OptionSlider(p, "Pips: how many", RIGHT, y, 5, 21, 2,
 		function() return db.pipCount end, function(v) db.pipCount = v end,
 		function(v) return tostring(v) end, function() return Design() == "pips" end)
 	y = OptionColor(p, "Move color", "moveColor", RIGHT, y, function() return not (db.moveAccent and ns.Styles and ns.Styles.S) end)
-	y = OptionCheck(p, "Use the window style's accent for move", "moveAccent", RIGHT, y)
-	OptionNote(p, RIGHT, y, COL - 20, function()
-		local Styles = ns.Styles
-		local name = Styles and Styles.Name(Styles.Applied() or "blizzard") or "Blizzard"
-		return "Look: " .. name .. ". The window style (Zone tab, Look) styles the displays too."
-	end)
+	OptionCheck(p, "Use the window style's accent for move", "moveAccent", RIGHT, y,
+		function() return ns.Styles ~= nil and ns.Styles.S ~= nil end)
 end
 
 local function BuildAlertsPage(p)
@@ -897,12 +906,18 @@ local function BuildAlertsPage(p)
 	y = y - 44
 	y = Header(p, "Call-out text", LEFT, y)
 	y = OptionCheck(p, "Say Stop, Moving, Late and Go", "callout", LEFT, y)
-	y = OptionSlider(p, "Text size", LEFT, y - 4, 14, 60, 2,
+	OptionSlider(p, "Text size", LEFT, y - 4, 14, 60, 2,
 		function() return db.calloutSize end, function(v) db.calloutSize = v end,
 		function(v) return v .. " pt" end, Is("callout"))
-	y = Header(p, "Sound", LEFT, y)
-	y = OptionCheck(p, "Play a sound as the zone starts", "sound", LEFT, y)
-	OptionCycle(p, LEFT, y, 200, function()
+
+	y = Header(p, "Screen edge", RIGHT, -4)
+	y = OptionCheck(p, "Tint the screen's edges to stand still", "edge", RIGHT, y)
+	y = OptionSlider(p, "Edge width", RIGHT, y - 4, 20, 300, 10,
+		function() return db.edgeSize end, function(v) db.edgeSize = v end,
+		function(v) return v .. " px" end, Is("edge"))
+	y = Header(p, "Sound", RIGHT, y)
+	y = OptionCheck(p, "Play a sound as the zone starts", "sound", RIGHT, y)
+	OptionCycle(p, RIGHT, y, 200, function()
 		local list = ns.SOUNDS or {}
 		local entry = list[db.soundKit] or list[1]
 		return "Sound: " .. (entry and entry.name or "?")
@@ -911,26 +926,150 @@ local function BuildAlertsPage(p)
 		if n > 0 then db.soundKit = ((db.soundKit or 1) - 1 + step) % n + 1 end
 		if ns.PlayKit then ns.PlayKit(db.soundKit) end
 	end, Is("sound"), { "Sound", "Plays once per swing as the stand-still zone starts.", "Clicking plays the new choice." })
-
-	y = Header(p, "Preview", RIGHT, -4)
-	y = Preview(p, RIGHT, y)
-	y = Header(p, "Screen edge", RIGHT, y)
-	y = OptionCheck(p, "Tint the screen's edges to stand still", "edge", RIGHT, y)
-	OptionSlider(p, "Edge width", RIGHT, y - 4, 20, 300, 10,
-		function() return db.edgeSize end, function(v) db.edgeSize = v end,
-		function(v) return v .. " px" end, Is("edge"))
 end
 
+local function BuildLookPage(p)
+	OptionStyle(p, LEFT, Header(p, "Look", LEFT, -4))
+	Header(p, "What it styles", RIGHT, -4)
+	local note = p:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	note:SetPoint("TOPLEFT", RIGHT + 4, -32)
+	note:SetWidth(COL - 20)
+	note:SetJustifyH("LEFT")
+	note:SetSpacing(3)
+	note:SetText("This window, the game's swing timer bars and every display, as the preview shows.\n\n"
+		.. "Blizzard: the swing timer's own art, bent round the arc, the ring and the reticle.\n\n"
+		.. "Dark and EllesmereUI: flat bars and displays in the style's colors, with its accent for the moving part.\n\n"
+		.. "Automatic is EllesmereUI when it is running, and Blizzard otherwise.")
+	Keep(p, "texts", note)
+end
+
+-- The tab on view, as Conjurer shows its profile tabs: the game's own selection (PanelTemplates),
+-- the selected tab lifted above its neighbours, and the preview's border above every tab, so their
+-- tops rest under it. Plain tabs color themselves.
 local function ShowTab(c, index)
 	currentTab = index
+	c.swTab = index
 	for i, page in ipairs(c.pages) do page:SetShown(i == index) end
-	for i, tab in ipairs(c.tabs) do
-		tab.swMark:SetShown(i == index)
-		if tab.LockHighlight then
-			if i == index then tab:LockHighlight() else tab:UnlockHighlight() end
+	if c.tabStyle == "PanelTabButtonTemplate" and PanelTemplates_SetTab then
+		pcall(PanelTemplates_SetTab, c.tabStrip, index)
+		local base = (c.tabStrip:GetFrameLevel() or 0) + 4
+		for i, tab in ipairs(c.tabs) do tab:SetFrameLevel(base + (i == index and 2 or 0)) end
+	else
+		for i, tab in ipairs(c.tabs) do
+			tab.selected = i == index
+			if tab.swBg then
+				if i == index then tab.swBg:SetColorTexture(0.35, 0.28, 0.12, 1) else tab.swBg:SetColorTexture(0.12, 0.1, 0.07, 0.95) end
+			end
 		end
 	end
+	if ns.SkinTabSelection then ns.SkinTabSelection(c, index) end
+	local border = c.previewBox and c.previewBox.NineSlice
+	if type(border) == "table" and border.SetFrameLevel then
+		local top = 0
+		for _, tab in ipairs(c.tabs) do top = math.max(top, tab:GetFrameLevel() or 0) end
+		border:SetFrameLevel(top + 1)
+	end
 	RefreshOptions()
+end
+
+-- The preview's box, in the game's inset art (or the same from color textures), across the top.
+local function BuildPreview(c)
+	local box, used = TryCreate("Frame", nil, c, { "InsetFrameTemplate" })
+	if used == "bare" or type(box.NineSlice) ~= "table" then
+		local bg = box:CreateTexture(nil, "BACKGROUND")
+		bg:SetAllPoints()
+		bg:SetColorTexture(0, 0, 0, 0.35)
+		-- The lines get a frame of their own, like the template's NineSlice, so they can go over the tabs.
+		box.NineSlice = CreateFrame("Frame", nil, box)
+		box.NineSlice:SetAllPoints()
+		for _, edge in ipairs({ { "TOPLEFT", "TOPRIGHT", true }, { "BOTTOMLEFT", "BOTTOMRIGHT", true },
+			{ "TOPLEFT", "BOTTOMLEFT", false }, { "TOPRIGHT", "BOTTOMRIGHT", false } }) do
+			local line = box.NineSlice:CreateTexture(nil, "BORDER")
+			line:SetColorTexture(0.45, 0.4, 0.3, 0.9)
+			line:SetPoint(edge[1])
+			line:SetPoint(edge[2])
+			if edge[3] then line:SetHeight(1) else line:SetWidth(1) end
+		end
+		used = "plain"
+	end
+	optionsReport.preview = used
+	box:SetPoint("TOPLEFT", 8, 0) -- inside the window's inset (4 to 594) as well as on the page
+	box:SetSize(W - 16, PREVIEW_H)
+	c.previewBox = box
+	if ns.NewPreview then c.preview = ns.NewPreview(box, W - 16, PREVIEW_H) end
+	box:EnableMouse(true)
+	box:SetScript("OnEnter", function(self)
+		if not GameTooltip then return end
+		GameTooltip:SetOwner(self, "ANCHOR_CURSOR")
+		GameTooltip:SetText("Preview", 1, 1, 1)
+		GameTooltip:AddLine("A made-up loop: an ordinary shot, one you move into (clipping, so it comes late and the zone holds), then one more.", nil, nil, nil, true)
+		GameTooltip:AddLine("It follows every setting: the zone on the game's bar, your display, the alerts and the look.", 0.8, 0.8, 0.8, true)
+		GameTooltip:Show()
+	end)
+	box:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+	return box
+end
+
+-- The tabs, hanging from the preview's bottom border like the character and spellbook window tabs
+-- (Conjurer's profile tabs): 3 apart, their tops 1 up, under the border. The game's tab art when
+-- every tab can have it, otherwise plain ones from color textures.
+local function BuildTabs(c, box)
+	local strip = CreateFrame("Frame", nil, c)
+	strip:SetPoint("TOPLEFT", box, "BOTTOMLEFT", 0, TAB_TUCK)
+	strip:SetSize(W - 16, TAB_H)
+	-- The template sizes its tabs to these whenever one is shown (PanelTabButtonMixin:OnShow).
+	strip.minTabWidth, strip.maxTabWidth = TAB_W, TAB_W
+	c.tabStrip, c.tabs = strip, {}
+	local style = "PanelTabButtonTemplate"
+	for i = 1, #TABS do
+		local ok, tab = pcall(CreateFrame, "Button", nil, strip, "PanelTabButtonTemplate")
+		if not (ok and tab and tab.Text and tab.Left and tab.LeftActive) then
+			if ok and tab then tab:Hide() end
+			style = "plain"
+			break
+		end
+		c.tabs[i] = tab
+	end
+	if style == "plain" then
+		for _, tab in ipairs(c.tabs) do tab:Hide() end
+		c.tabs = {}
+		for i = 1, #TABS do
+			local tab = CreateFrame("Button", nil, strip)
+			tab:SetSize(TAB_W, 24)
+			tab.swBg = tab:CreateTexture(nil, "BACKGROUND")
+			tab.swBg:SetAllPoints()
+			tab.swBg:SetColorTexture(0.12, 0.1, 0.07, 0.95)
+			local fs = tab:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+			fs:SetPoint("CENTER")
+			tab:SetFontString(fs)
+			tab.Text = fs
+			local hl = tab:CreateTexture(nil, "HIGHLIGHT")
+			hl:SetAllPoints()
+			hl:SetColorTexture(1, 1, 1, 0.1)
+			c.tabs[i] = tab
+		end
+	end
+	c.tabStyle = style
+	optionsReport.tabs = style
+	for i, tab in ipairs(c.tabs) do
+		local label, tip = TABS[i][1], TABS[i][2]
+		tab:SetID(i)
+		tab:SetText(label)
+		if style == "PanelTabButtonTemplate" and PanelTemplates_TabResize then pcall(PanelTemplates_TabResize, tab, 0, TAB_W) end
+		tab:ClearAllPoints()
+		if i == 1 then
+			tab:SetPoint("TOPLEFT", strip, "TOPLEFT", TAB_X, 0)
+		else
+			tab:SetPoint("LEFT", c.tabs[i - 1], "RIGHT", TAB_GAP, 0)
+		end
+		tab:SetScript("OnClick", function()
+			if PlaySound then pcall(PlaySound, (SOUNDKIT and SOUNDKIT.IG_CHARACTER_INFO_TAB) or 841) end
+			ShowTab(c, i)
+		end)
+		Tooltip(tab, label, function() return { { tip } } end)
+		Keep(c, "tabs", tab)
+	end
+	if style == "PanelTabButtonTemplate" then strip.numTabs = #c.tabs end
 end
 
 local function BuildZonePage(c)
@@ -972,10 +1111,7 @@ local function BuildZonePage(c)
 		function() return db.lineWidth end,
 		function(v) db.lineWidth = v end,
 		function(v) return v .. " px" end, Is("line"))
-	y = OptionColor(c, "Line color", "lineColor", LEFT, y, Is("line"))
-
-	y = Header(c, "Look", LEFT, y - 8)
-	OptionStyle(c, LEFT, y)
+	OptionColor(c, "Line color", "lineColor", LEFT, y, Is("line"))
 
 	y = Header(c, "Red zone", RIGHT, -4)
 	y = OptionCheck(c, "Show the red zone", "band", RIGHT, y)
@@ -1000,7 +1136,7 @@ local function BuildContent()
 	local c = CreateFrame("Frame")
 	c:SetSize(W, CONTENT_H)
 	c:Hide() -- a shown frame with no parent counts as visible
-	c.swParts = { headers = {}, checks = {}, sliders = {}, buttons = {}, texts = {} }
+	c.swParts = { headers = {}, checks = {}, sliders = {}, buttons = {}, texts = {}, tabs = {} }
 
 	-- A class with no Auto Shot or wand Shoot gets the look and nothing else, and is told why.
 	if not shotSpell then
@@ -1011,26 +1147,17 @@ local function BuildContent()
 		why:SetText("This character has no Auto Shot or wand Shoot, so there is no stand-still zone. What applies here is the look: under the Dark or EllesmereUI window style, the game's swing timer bars are drawn flat.")
 		Keep(c, "texts", why)
 		OptionStyle(c, LEFT, Header(c, "Look", LEFT, -48))
+		c:SetHeight(SHORT_H)
 		return BuildFooter(c, false)
 	end
 
-	-- Three pages under a row of tabs: the zone on the game's bar, the display, the alerts.
-	c.pages, c.tabs = {}, {}
-	for i, label in ipairs({ "Zone", "Display", "Alerts" }) do
-		local tab, used = TryCreate("Button", nil, c, { "UIPanelButtonTemplate" })
-		if used == "bare" then DressBare(tab, 110, 22, label) else tab:SetSize(110, 22) tab:SetText(label) end
-		tab:SetPoint("TOPRIGHT", -(8 + (3 - i) * 116), -2) -- on the right, clear of the page title
-		tab:SetScript("OnClick", function() ShowTab(c, i) end)
-		local mark = c:CreateTexture(nil, "ARTWORK")
-		mark:SetColorTexture(1, 0.82, 0, 0.9)
-		mark:SetPoint("TOPLEFT", tab, "BOTTOMLEFT", 2, -1)
-		mark:SetPoint("TOPRIGHT", tab, "BOTTOMRIGHT", -2, -1)
-		mark:SetHeight(2)
-		tab.swMark = mark
-		Keep(c, "buttons", tab)
-		c.tabs[i] = tab
+	-- The preview on top, whichever tab is open; under it the tabs, and under them the pages: the
+	-- zone on the game's bar, the display, the alerts, the look.
+	BuildTabs(c, BuildPreview(c))
+	c.pages = {}
+	for i = 1, #TABS do
 		local page = CreateFrame("Frame", nil, c)
-		page:SetPoint("TOPLEFT", 0, -TAB_H)
+		page:SetPoint("TOPLEFT", 0, -PAGE_TOP)
 		page:SetSize(W, PAGE_H)
 		page.swParts = c.swParts
 		page:Hide()
@@ -1039,6 +1166,7 @@ local function BuildContent()
 	BuildZonePage(c.pages[1])
 	BuildDisplayPage(c.pages[2])
 	BuildAlertsPage(c.pages[3])
+	BuildLookPage(c.pages[4])
 	ShowTab(c, currentTab)
 	return BuildFooter(c, true)
 end
@@ -1099,8 +1227,9 @@ end
 
 local function BuildWindow()
 	local f, template = TryCreate("Frame", "ShotWindowOptions", UIParent, { "ButtonFrameTemplate", "BasicFrameTemplateWithInset" })
-	local top = template == "ButtonFrameTemplate" and -60 or -28
-	f:SetSize(W, CONTENT_H - top + 10)
+	-- The controls sit 4 inside the inset's top edge, so the preview's border does not lie on it.
+	local top = (template == "ButtonFrameTemplate" and -60 or -28) - 4
+	f:SetSize(W, (content and content:GetHeight() or CONTENT_H) - top + 10)
 	f:SetPoint("CENTER")
 	f:SetFrameStrata("HIGH") -- below the DIALOG color picker
 	f:SetToplevel(true)
@@ -1216,13 +1345,14 @@ local function RegisterOptionsPage()
 	page:SetScript("OnShow", function(self)
 		if not EnsureContent() then return end
 		if window and window:IsShown() then window:Hide() end
-		-- With tabs, the tab row shares the line with the page title (tabs on the right), so the
-		-- controls start higher and the page keeps its full size.
+		-- With tabs, the preview takes the top in place of the page title (the list on the left
+		-- names the page), so the controls start higher and the page keeps its full size.
 		local tabbed = content.pages ~= nil
+		title:SetShown(not tabbed)
 		local top = tabbed and -10 or -42
 		local w, h = self:GetWidth() or 0, self:GetHeight() or 0
 		local scale = 1
-		if w > 0 and h > 0 then scale = math.min(1, (w - 12) / W, (h + top - 8) / CONTENT_H) end
+		if w > 0 and h > 0 then scale = math.min(1, (w - 12) / W, (h + top - 8) / (content:GetHeight() or CONTENT_H)) end
 		Host(content, self, 6, top, scale)
 	end)
 	page:SetScript("OnSizeChanged", function(self)
@@ -1250,7 +1380,7 @@ local function Debug()
 	Print(("shot spell %s, auto-repeat %s, %s"):format(tostring(shotSpell), tostring(autoRepeat),
 		waitingSince and "waiting for a late shot" or (swingStart and "swing running" or "idle")))
 	local parts = {}
-	for _, k in ipairs({ "page", "open", "window", "slider", "check", "swatch", "picker" }) do
+	for _, k in ipairs({ "page", "open", "window", "slider", "check", "swatch", "picker", "tabs", "preview" }) do
 		if optionsReport[k] then parts[#parts + 1] = k .. "=" .. optionsReport[k] end
 	end
 	Print("options: " .. (#parts > 0 and table.concat(parts, ", ") or "not opened yet"))
