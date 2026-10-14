@@ -15,7 +15,7 @@
 
 local ADDON, ns = ...
 
-ns.VERSION = "0.2.1"
+ns.VERSION = "0.3.0"
 
 local RANGED = Enum and Enum.PlayerSwingType and Enum.PlayerSwingType.Ranged or 2
 local RED = { 0.95, 0.20, 0.15 }
@@ -41,6 +41,31 @@ local DEFAULTS = {
 	fillTint = false, -- turn the bar's fill red while the swing is inside the zone
 	fillColor = { RED[1], RED[2], RED[3] },
 	fillAlpha = 0.75,
+	-- Alerts: the same on the game's bar and on every display
+	warnMove = true,  -- the zone turns the clip color while you move inside it
+	clipColor = { 1, 0.6, 0.1 },
+	lateText = true,  -- "+0.42" after a shot that came late
+	callout = false,  -- big "Stop" / "Moving" / "Late" / "Go" text
+	calloutSize = 26,
+	edge = false,     -- tint the screen's edges while you must stand still
+	edgeSize = 90,
+	sound = false,    -- a sound as the stand-still zone starts
+	soundKit = 1,
+	-- Display of our own (Displays.lua)
+	display = "none",
+	moveColor = { 0.39, 0.6, 0.13 },
+	moveAccent = true, -- under the Dark and EllesmereUI styles, the move color is the style's accent
+	dispWidth = 240,
+	dispHeight = 16,
+	dispSize = 140,
+	dispThick = 12,
+	artFlip = false, -- Blizzard art on the round designs drawn upside down (an in-game check; /shotwindow flipart)
+	dispLocked = true,
+	dispAlways = false,
+	dispOnBar = false,
+	scanMode = "pingpong", -- the scanner's spark: "pingpong" (out and back) or "wrap" (left to right)
+	trackSeconds = 5,      -- seconds the rhythm track shows
+	pipCount = 11,
 	-- Look of the options window (Styles.lua)
 	style = "auto",  -- "auto" (EllesmereUI when it is running), "blizzard" or "dark"
 	darkAlpha = 0.92, -- background opacity of the Dark style
@@ -61,6 +86,11 @@ local autoRepeat     -- whether Auto Shot is on (START/STOP_AUTOREPEAT_SPELL)
 local waitingSince   -- GetTime() when we began waiting for a shot the bar no longer shows, or nil
 local waitUntil      -- GetTime() after which we stop waiting; pushed back while the shot keeps retrying
 local RefreshOptions -- set by the options code below
+local moving = false -- PLAYER_STARTED_MOVING / PLAYER_STOPPED_MOVING
+local lastShotAt     -- GetTime() of the last ranged PLAYER_SWING
+local shotCount = 0  -- shots seen, for designs that alternate sides
+local lastLateBy     -- how late the last shot was, in seconds, or nil
+local waitKind       -- "late" when the bar ran out before the shot, "first" for the first shot's wind-up
 
 -- The auto-repeating ranged attack each class has: Auto Shot for hunters, Shoot for wand users.
 local SHOT_SPELL = { HUNTER = 75, MAGE = 5019, PRIEST = 5019, WARLOCK = 5019 }
@@ -127,6 +157,26 @@ local function CreateTextures()
 	tex.fill:Hide()
 	local fill = bar.GetStatusBarTexture and bar:GetStatusBarTexture()
 	if fill then tex.fill:SetAllPoints(fill) end
+	-- "+0.42" above the bar's end after a late shot (only while no display of our own shows it).
+	tex.late = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	tex.late:SetPoint("BOTTOMRIGHT", bar, "TOPRIGHT", 0, 2)
+	tex.late:Hide()
+end
+
+local LATE_SHOWN = 1.5 -- seconds a late shot's delay stays up
+
+local function LateTextOnBar(now)
+	if not tex.late then return end
+	local show = db.lateText and (db.display or "none") == "none" and lastLateBy and lastShotAt
+		and now - lastShotAt < LATE_SHOWN
+	if show then
+		local c = db.clipColor
+		tex.late:SetText(("+%.2f"):format(lastLateBy))
+		tex.late:SetTextColor(c[1], c[2], c[3])
+		tex.late:Show()
+	else
+		tex.late:Hide()
+	end
 end
 
 -- The zone lights up only while Auto Shot is on. Unknown (no event seen and no way to ask)
@@ -135,16 +185,21 @@ local function Lit()
 	return inside and autoRepeat ~= false
 end
 
+-- Moving during the wind-up delays the shot: the zone says so in the clip color.
+local function Clipping()
+	return Lit() and moving and db.warnMove and true or false
+end
+
 -- Colors follow the settings and whether the swing is inside the zone.
 local function ApplyLook()
 	if not tex.stand then return end
 	local lit = Lit()
-	local c = db.color
+	local c = Clipping() and db.clipColor or db.color
 	local a = (lit and db.flash) and db.activeAlpha or db.idleAlpha
 	tex.stand:SetColorTexture(c[1], c[2], c[3], a)
 	local l = db.lineColor
 	tex.line:SetColorTexture(l[1], l[2], l[3], 0.95)
-	local f = db.fillColor
+	local f = Clipping() and db.clipColor or db.fillColor
 	tex.fill:SetColorTexture(f[1], f[2], f[3], db.fillAlpha)
 	tex.fill:SetShown(lit and db.fillTint and true or false)
 end
@@ -214,7 +269,8 @@ local driver = CreateFrame("Frame")
 
 local OnUpdate
 
-local function BeginWait()
+local function BeginWait(kind)
+	waitKind = kind or "late"
 	waitingSince = GetTime()
 	waitUntil = waitingSince + WAIT_CAP
 	Layout() -- the first shot's wait may come before anything drew the zone
@@ -223,16 +279,20 @@ local function BeginWait()
 	driver:SetScript("OnUpdate", OnUpdate)
 end
 
+-- The clock stops ticking when nothing runs, unless a late readout still has to be taken down.
+local function KeepTicking() return tex.late and tex.late:IsShown() end
+
 local function StopWaiting()
 	if not waitingSince then return end
-	waitingSince = nil
+	waitingSince, waitKind = nil, nil
 	if tex.stand then tex.stand:SetAlpha(1) end
 	SetInside(false)
-	if not swingStart then driver:SetScript("OnUpdate", nil) end
+	if not swingStart and not KeepTicking() then driver:SetScript("OnUpdate", nil) end
 end
 
 OnUpdate = function()
 	local now = GetTime()
+	LateTextOnBar(now)
 	if swingStart then
 		local elapsed = now - swingStart
 		if elapsed < swingDuration then
@@ -241,11 +301,11 @@ OnUpdate = function()
 		end
 		swingStart = nil
 		if db.hold and autoRepeat == true and tex.stand then
-			BeginWait()
+			BeginWait("late")
 			return
 		end
 		SetInside(false)
-		driver:SetScript("OnUpdate", nil)
+		if not KeepTicking() then driver:SetScript("OnUpdate", nil) end
 		return
 	end
 	if waitingSince then
@@ -257,7 +317,7 @@ OnUpdate = function()
 		end
 		return
 	end
-	driver:SetScript("OnUpdate", nil)
+	if not KeepTicking() then driver:SetScript("OnUpdate", nil) end
 end
 
 local function StartSwing(duration)
@@ -306,7 +366,7 @@ local function ShotPending()
 	if waitingSince then
 		waitUntil = GetTime() + WAIT_CAP
 	else
-		BeginWait()
+		BeginWait("late")
 	end
 end
 
@@ -315,7 +375,7 @@ local function SetAutoRepeat(on)
 	if on then
 		-- No swing running: the first shot's wind-up comes next, so stand still now.
 		if not swingStart and not waitingSince and db.hold and tex.stand then
-			BeginWait()
+			BeginWait("first")
 			return
 		end
 	else
@@ -331,13 +391,49 @@ local function ApplySettings()
 	if tex.stand and not (waitingSince and db.pulse) then tex.stand:SetAlpha(1) end
 	ApplyLook()
 	Layout()
+	if ns.ApplyDisplay then ns.ApplyDisplay() end
 	if RefreshOptions then RefreshOptions() end
 end
 
 local function OnSwing(duration, swingType)
 	if Secret(duration) or Secret(swingType) then return end
 	if swingType ~= RANGED or type(duration) ~= "number" or duration <= 0 then return end
+	local now = GetTime()
+	-- Late when the bar had already run out and we were holding for this shot.
+	lastLateBy = (waitingSince and waitKind == "late") and (now - waitingSince) or nil
+	if lastLateBy and lastLateBy < 0.1 then lastLateBy = nil end -- the usual report jitter
+	lastShotAt = now
+	shotCount = shotCount + 1
 	StartSwing(duration)
+	LateTextOnBar(now)
+end
+
+-- What the clock says, for the displays and the alerts (Displays.lua). s is reused.
+ns.WeaponSpeed = WeaponSpeed
+function ns.Lead() return db and Lead() or 0.5 end
+function ns.HasShot() return shotSpell ~= nil end
+function ns.ClockState(s)
+	if not db then return nil end
+	local now = GetTime()
+	s.dur = swingDuration or WeaponSpeed()
+	s.lead = Lead()
+	s.autoRepeat = autoRepeat
+	s.parity = shotCount % 2
+	if swingStart then
+		s.t = math.min(now - swingStart, swingDuration)
+		s.waiting, s.waitAge, s.waitKind = false, nil, nil
+	elseif waitingSince then
+		s.t = nil
+		s.waiting, s.waitAge, s.waitKind = true, now - waitingSince, waitKind
+	else
+		s.t, s.waiting, s.waitAge, s.waitKind = nil, false, nil, nil
+	end
+	s.lit = Lit() and true or false
+	s.moving = moving
+	s.clipping = Clipping()
+	s.sinceShot = lastShotAt and (now - lastShotAt) or nil
+	s.lateBy = (lastLateBy and s.sinceShot and s.sinceShot < LATE_SHOWN) and lastLateBy or nil
+	return s
 end
 
 local function Attach()
@@ -366,7 +462,10 @@ local content, window, settingsPage, settingsCategory
 local windowContent -- the window's own copy of the controls, made while a style is drawn
 local nativeOpenFailed, toldToClose = false, false
 local optionsReport = {} -- printed by /shotwindow debug
-local W, CONTENT_H = 600, 532
+local TAB_H = 30 -- the row of tabs above the pages
+local W, CONTENT_H = 600, 532 + TAB_H
+local PAGE_H = CONTENT_H - TAB_H
+local currentTab = 1
 local COL, LEFT, RIGHT = 290, 8, 304
 local sliderCount = 0
 
@@ -493,7 +592,7 @@ local function OptionSlider(parent, label, x, y, minV, maxV, step, get, set, fmt
 	if slider.SetObeyStepOnDrag then pcall(slider.SetObeyStepOnDrag, slider, true) end
 	Keep(parent, "sliders", { slider = slider, caption = caption, value = value })
 	slider:SetScript("OnValueChanged", function(self, v)
-		v = math.floor(v / step + 0.5) * step
+		v = minV + math.floor((v - minV) / step + 0.5) * step -- steps counted from the low end (odd pip counts)
 		value:SetText(fmt(v))
 		if self.syncing then return end -- our own SetValue, not the player
 		set(v)
@@ -659,23 +758,182 @@ end
 
 local BuildFooter -- the row along the bottom, below
 
-local function BuildContent()
-	local c = CreateFrame("Frame")
-	c:SetSize(W, CONTENT_H)
-	c:Hide() -- a shown frame with no parent counts as visible
-	c.swParts = { headers = {}, checks = {}, sliders = {}, buttons = {}, texts = {} }
-
-	-- A class with no Auto Shot or wand Shoot gets the look and nothing else, and is told why.
-	if not shotSpell then
-		local why = c:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		why:SetPoint("TOPLEFT", LEFT + 4, -4)
-		why:SetWidth(W - 24)
-		why:SetJustifyH("LEFT")
-		why:SetText("This character has no Auto Shot or wand Shoot, so there is no stand-still zone. What applies here is the look: under the Dark or EllesmereUI window style, the game's swing timer bars are drawn flat.")
-		Keep(c, "texts", why)
-		OptionStyle(c, LEFT, Header(c, "Look", LEFT, -48))
-		return BuildFooter(c, false)
+-- A button that steps through choices: left click forward, right click back.
+local function OptionCycle(parent, x, y, width, label, step, enabled, tip)
+	local button, used = TryCreate("Button", nil, parent, { "UIPanelButtonTemplate" })
+	if used == "bare" then DressBare(button, width, 22, "") else button:SetSize(width, 22) end
+	button:SetPoint("TOPLEFT", x + 4, y)
+	button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	button:SetScript("OnClick", function(_, which)
+		step(which == "RightButton" and -1 or 1)
+		ApplySettings()
+	end)
+	if tip then
+		Tooltip(button, tip[1], function()
+			local lines = {}
+			for i = 2, #tip do lines[#lines + 1] = { tip[i] } end
+			lines[#lines + 1] = { "Left-click for the next, right-click for the previous.", 0.6, 0.6, 0.6 }
+			return lines
+		end)
 	end
+	Keep(parent, "buttons", button)
+	optionRefreshers[#optionRefreshers + 1] = function()
+		button:SetText(label())
+		if enabled then SetUsable(button, enabled()) end
+	end
+	return y - 28, button
+end
+
+local function OptionButton(parent, x, y, width, text, onClick, enabled)
+	local button, used = TryCreate("Button", nil, parent, { "UIPanelButtonTemplate" })
+	if used == "bare" then DressBare(button, width, 22, text) else button:SetSize(width, 22) button:SetText(text) end
+	button:SetPoint("TOPLEFT", x + 4, y)
+	button:SetScript("OnClick", onClick)
+	Keep(parent, "buttons", button)
+	if enabled then optionRefreshers[#optionRefreshers + 1] = function() SetUsable(button, enabled()) end end
+	return y - 28, button
+end
+
+-- A line of grey text that a function keeps up to date.
+local function OptionNote(parent, x, y, width, text)
+	local note = parent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	note:SetPoint("TOPLEFT", x + 4, y)
+	note:SetWidth(width)
+	note:SetJustifyH("LEFT")
+	Keep(parent, "texts", note)
+	optionRefreshers[#optionRefreshers + 1] = function() note:SetText(text()) end
+	return note
+end
+
+local function Step(list, current, step)
+	local index = 1
+	for i, v in ipairs(list) do if v == current then index = i end end
+	return list[(index - 1 + step) % #list + 1]
+end
+
+local function Preview(parent, x, y)
+	if not ns.NewPreview then return y end
+	local box = ns.NewPreview(parent, COL - 20, 150)
+	box:SetPoint("TOPLEFT", x + 4, y)
+	local caption = parent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	caption:SetPoint("TOPLEFT", x + 4, y - 154)
+	caption:SetWidth(COL - 20)
+	caption:SetJustifyH("LEFT")
+	caption:SetText("A made-up loop: an ordinary shot, one you move into (clipping, so it comes late and the display holds), then one more.")
+	Keep(parent, "texts", caption)
+	return y - 186
+end
+
+local function Design() return db.display or "none" end
+local function HasDisplay() return Design() ~= "none" end
+local function IsRound() return ns.ROUND_DISPLAYS and ns.ROUND_DISPLAYS[Design()] or false end
+
+local function BuildDisplayPage(p)
+	local y = Header(p, "Display", LEFT, -4)
+	y = OptionCycle(p, LEFT, y, 260, function()
+		return "Design: " .. ((ns.DISPLAY_NAMES or {})[Design()] or Design())
+	end, function(step)
+		db.display = Step(ns.DISPLAYS or { "none" }, Design(), step)
+	end, nil, { "Design", "A display of its own, besides the marks on the game's bar.",
+		"Every design shows the same things: when to move and when to stand still, the hold for a late shot, clipping, and the shot itself." })
+	OptionNote(p, LEFT, y, COL - 20, function() return (ns.DISPLAY_NOTES or {})[Design()] or "" end)
+	y = y - 36
+	y = OptionCheck(p, "Lock in place", "dispLocked", LEFT, y, function() return HasDisplay() and not db.dispOnBar end)
+	y = OptionButton(p, LEFT, y, 140, "Reset position", function()
+		db.dispPos = nil
+		ApplySettings()
+	end, function() return HasDisplay() and not db.dispOnBar end)
+	y = OptionCheck(p, "Sit on the game's swing bar", "dispOnBar", LEFT, y, HasDisplay)
+	y = OptionCheck(p, "Show out of combat too", "dispAlways", LEFT, y, HasDisplay)
+	y = Header(p, "Size", LEFT, y - 8)
+	local function Straight() return HasDisplay() and not IsRound() end
+	local function Round() return HasDisplay() and IsRound() end
+	y = OptionSlider(p, "Length", LEFT, y, 80, 600, 10,
+		function() return db.dispWidth end, function(v) db.dispWidth = v end,
+		function(v) return v .. " px" end, Straight)
+	y = OptionSlider(p, "Thickness of a bar", LEFT, y, 4, 60, 1,
+		function() return db.dispHeight end, function(v) db.dispHeight = v end,
+		function(v) return v .. " px" end, Straight)
+	y = OptionSlider(p, "Size of a round design", LEFT, y, 60, 400, 5,
+		function() return db.dispSize end, function(v) db.dispSize = v end,
+		function(v) return v .. " px" end, Round)
+	OptionSlider(p, "Line thickness of a round design", LEFT, y, 2, 30, 1,
+		function() return db.dispThick end, function(v) db.dispThick = v end,
+		function(v) return v .. " px" end, Round)
+
+	y = Header(p, "Preview", RIGHT, -4)
+	y = Preview(p, RIGHT, y)
+	y = Header(p, "Design options", RIGHT, y)
+	y = OptionCycle(p, RIGHT, y, 260, function()
+		return "Scanner: " .. (db.scanMode == "wrap" and "left to right" or "out and back")
+	end, function()
+		db.scanMode = (db.scanMode == "wrap") and "pingpong" or "wrap"
+	end, function() return Design() == "scanner" end, { "Scanner sweep",
+		"Out and back: the spark crosses the shot line at each shot and turns at the ends.",
+		"Left to right: the spark always crosses from left to right and wraps round." })
+	y = OptionSlider(p, "Rhythm track: seconds shown", RIGHT, y - 4, 2, 12, 1,
+		function() return db.trackSeconds end, function(v) db.trackSeconds = v end,
+		function(v) return v .. " s" end, function() return Design() == "track" end)
+	y = OptionSlider(p, "Pips: how many", RIGHT, y, 5, 21, 2,
+		function() return db.pipCount end, function(v) db.pipCount = v end,
+		function(v) return tostring(v) end, function() return Design() == "pips" end)
+	y = OptionColor(p, "Move color", "moveColor", RIGHT, y, function() return not (db.moveAccent and ns.Styles and ns.Styles.S) end)
+	y = OptionCheck(p, "Use the window style's accent for move", "moveAccent", RIGHT, y)
+	OptionNote(p, RIGHT, y, COL - 20, function()
+		local Styles = ns.Styles
+		local name = Styles and Styles.Name(Styles.Applied() or "blizzard") or "Blizzard"
+		return "Look: " .. name .. ". The window style (Zone tab, Look) styles the displays too."
+	end)
+end
+
+local function BuildAlertsPage(p)
+	local y = Header(p, "Clipping and late shots", LEFT, -4)
+	y = OptionCheck(p, "Warn when I move inside the zone", "warnMove", LEFT, y)
+	y = OptionColor(p, "Clip color", "clipColor", LEFT, y, function() return db.warnMove or db.lateText end)
+	y = OptionCheck(p, "Show how late a late shot was", "lateText", LEFT, y)
+	OptionNote(p, LEFT, y, COL - 20, function()
+		return "Moving during the wind-up delays the shot. The warning shows on the game's bar and on every display; the delay shows above the bar or under the display."
+	end)
+	y = y - 44
+	y = Header(p, "Call-out text", LEFT, y)
+	y = OptionCheck(p, "Say Stop, Moving, Late and Go", "callout", LEFT, y)
+	y = OptionSlider(p, "Text size", LEFT, y - 4, 14, 60, 2,
+		function() return db.calloutSize end, function(v) db.calloutSize = v end,
+		function(v) return v .. " pt" end, Is("callout"))
+	y = Header(p, "Sound", LEFT, y)
+	y = OptionCheck(p, "Play a sound as the zone starts", "sound", LEFT, y)
+	OptionCycle(p, LEFT, y, 200, function()
+		local list = ns.SOUNDS or {}
+		local entry = list[db.soundKit] or list[1]
+		return "Sound: " .. (entry and entry.name or "?")
+	end, function(step)
+		local n = #(ns.SOUNDS or {})
+		if n > 0 then db.soundKit = ((db.soundKit or 1) - 1 + step) % n + 1 end
+		if ns.PlayKit then ns.PlayKit(db.soundKit) end
+	end, Is("sound"), { "Sound", "Plays once per swing as the stand-still zone starts.", "Clicking plays the new choice." })
+
+	y = Header(p, "Preview", RIGHT, -4)
+	y = Preview(p, RIGHT, y)
+	y = Header(p, "Screen edge", RIGHT, y)
+	y = OptionCheck(p, "Tint the screen's edges to stand still", "edge", RIGHT, y)
+	OptionSlider(p, "Edge width", RIGHT, y - 4, 20, 300, 10,
+		function() return db.edgeSize end, function(v) db.edgeSize = v end,
+		function(v) return v .. " px" end, Is("edge"))
+end
+
+local function ShowTab(c, index)
+	currentTab = index
+	for i, page in ipairs(c.pages) do page:SetShown(i == index) end
+	for i, tab in ipairs(c.tabs) do
+		tab.swMark:SetShown(i == index)
+		if tab.LockHighlight then
+			if i == index then tab:LockHighlight() else tab:UnlockHighlight() end
+		end
+	end
+	RefreshOptions()
+end
+
+local function BuildZonePage(c)
 
 	local y = Header(c, "Timing", LEFT, -4)
 	y = OptionSlider(c, "Aim window (the shot's wind-up)", LEFT, y, 0, 1000, 10,
@@ -736,6 +994,52 @@ local function BuildContent()
 	y = OptionColor(c, "Fill color", "fillColor", RIGHT, y, Is("fillTint"))
 	get, set, fmt = Percent("fillAlpha")
 	OptionSlider(c, "Fill opacity", RIGHT, y - 4, 0, 100, 5, get, set, fmt, Is("fillTint"))
+end
+
+local function BuildContent()
+	local c = CreateFrame("Frame")
+	c:SetSize(W, CONTENT_H)
+	c:Hide() -- a shown frame with no parent counts as visible
+	c.swParts = { headers = {}, checks = {}, sliders = {}, buttons = {}, texts = {} }
+
+	-- A class with no Auto Shot or wand Shoot gets the look and nothing else, and is told why.
+	if not shotSpell then
+		local why = c:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		why:SetPoint("TOPLEFT", LEFT + 4, -4)
+		why:SetWidth(W - 24)
+		why:SetJustifyH("LEFT")
+		why:SetText("This character has no Auto Shot or wand Shoot, so there is no stand-still zone. What applies here is the look: under the Dark or EllesmereUI window style, the game's swing timer bars are drawn flat.")
+		Keep(c, "texts", why)
+		OptionStyle(c, LEFT, Header(c, "Look", LEFT, -48))
+		return BuildFooter(c, false)
+	end
+
+	-- Three pages under a row of tabs: the zone on the game's bar, the display, the alerts.
+	c.pages, c.tabs = {}, {}
+	for i, label in ipairs({ "Zone", "Display", "Alerts" }) do
+		local tab, used = TryCreate("Button", nil, c, { "UIPanelButtonTemplate" })
+		if used == "bare" then DressBare(tab, 110, 22, label) else tab:SetSize(110, 22) tab:SetText(label) end
+		tab:SetPoint("TOPRIGHT", -(8 + (3 - i) * 116), -2) -- on the right, clear of the page title
+		tab:SetScript("OnClick", function() ShowTab(c, i) end)
+		local mark = c:CreateTexture(nil, "ARTWORK")
+		mark:SetColorTexture(1, 0.82, 0, 0.9)
+		mark:SetPoint("TOPLEFT", tab, "BOTTOMLEFT", 2, -1)
+		mark:SetPoint("TOPRIGHT", tab, "BOTTOMRIGHT", -2, -1)
+		mark:SetHeight(2)
+		tab.swMark = mark
+		Keep(c, "buttons", tab)
+		c.tabs[i] = tab
+		local page = CreateFrame("Frame", nil, c)
+		page:SetPoint("TOPLEFT", 0, -TAB_H)
+		page:SetSize(W, PAGE_H)
+		page.swParts = c.swParts
+		page:Hide()
+		c.pages[i] = page
+	end
+	BuildZonePage(c.pages[1])
+	BuildDisplayPage(c.pages[2])
+	BuildAlertsPage(c.pages[3])
+	ShowTab(c, currentTab)
 	return BuildFooter(c, true)
 end
 
@@ -912,10 +1216,14 @@ local function RegisterOptionsPage()
 	page:SetScript("OnShow", function(self)
 		if not EnsureContent() then return end
 		if window and window:IsShown() then window:Hide() end
+		-- With tabs, the tab row shares the line with the page title (tabs on the right), so the
+		-- controls start higher and the page keeps its full size.
+		local tabbed = content.pages ~= nil
+		local top = tabbed and -10 or -42
 		local w, h = self:GetWidth() or 0, self:GetHeight() or 0
 		local scale = 1
-		if w > 0 and h > 0 then scale = math.min(1, (w - 12) / W, (h - 50) / CONTENT_H) end
-		Host(content, self, 6, -42, scale)
+		if w > 0 and h > 0 then scale = math.min(1, (w - 12) / W, (h + top - 8) / CONTENT_H) end
+		Host(content, self, 6, top, scale)
 	end)
 	page:SetScript("OnSizeChanged", function(self)
 		if self:IsVisible() and content and content:GetParent() == self then self:GetScript("OnShow")(self) end
@@ -946,6 +1254,7 @@ local function Debug()
 		if optionsReport[k] then parts[#parts + 1] = k .. "=" .. optionsReport[k] end
 	end
 	Print("options: " .. (#parts > 0 and table.concat(parts, ", ") or "not opened yet"))
+	Print("display: " .. (ns.DisplayReport and ns.DisplayReport() or "?"))
 	Print("skin: " .. tostring(ns.report.skin))
 	Print("swing bars: " .. tostring(ns.report["swing bars"] or "never styled"))
 	for _, name in ipairs({ "SwingTimerMainHandFrame", "SwingTimerRangedFrame" }) do
@@ -977,13 +1286,15 @@ local function Usage()
 	Print("/shotwindow latency  - toggle starting the red zone earlier by your latency (now " .. (db.latency and "on" or "off") .. ")")
 	Print("/shotwindow flash  - toggle brightening the red zone while you are in it (now " .. (db.flash and "on" or "off") .. ")")
 	Print("/shotwindow style [auto|blizzard|dark]  - the options window's look (now " .. ns.Styles.Name(db.style) .. ")")
+	Print("/shotwindow display [" .. table.concat(ns.DISPLAYS or {}, "|") .. "]  - a display of its own (now " .. tostring(db.display) .. ")")
+	Print("/shotwindow lock | unlock  - fix or move that display")
 	Print("/shotwindow debug")
 end
 
 local function Slash(msg)
 	local cmd, rest = (msg or ""):match("^%s*(%S*)%s*(.-)%s*$")
 	cmd = cmd:lower()
-	if not shotSpell and (cmd == "window" or cmd == "latency" or cmd == "flash") then
+	if not shotSpell and (cmd == "window" or cmd == "latency" or cmd == "flash" or cmd == "display" or cmd == "lock" or cmd == "unlock") then
 		Usage() -- zone settings, and this character has no zone
 		return
 	end
@@ -1008,6 +1319,23 @@ local function Slash(msg)
 	elseif cmd == "debug" then
 		Debug()
 		return
+	elseif cmd == "display" then
+		local want = rest:lower()
+		if want == "" then
+			db.display = Step(ns.DISPLAYS or { "none" }, db.display or "none", 1)
+		elseif ns.DISPLAY_NAMES and ns.DISPLAY_NAMES[want] then
+			db.display = want
+		else
+			Print("displays: " .. table.concat(ns.DISPLAYS or {}, ", "))
+			return
+		end
+		Print("display: " .. (ns.DISPLAY_NAMES[db.display] or db.display))
+	elseif cmd == "flipart" then
+		db.artFlip = not db.artFlip
+		Print("Blizzard art on the round designs " .. (db.artFlip and "flipped" or "the right way up") .. ". Use this if the frame's bright edge sits on the inside.")
+	elseif cmd == "lock" or cmd == "unlock" then
+		db.dispLocked = (cmd == "lock")
+		Print(db.dispLocked and "display locked" or "display unlocked: drag it, then /shotwindow lock")
 	elseif cmd == "style" then
 		local Styles, style = ns.Styles, rest:lower()
 		if style == "auto" or style == "automatic" then Styles.Set("auto")
@@ -1058,7 +1386,12 @@ driver:SetScript("OnEvent", function(self, event, ...)
 			self:RegisterEvent("ADDON_LOADED")
 		end
 		autoRepeat = ReadAutoRepeat()
+		if IsPlayerMoving then
+			local okMove, m = pcall(IsPlayerMoving)
+			if okMove and not Secret(m) and type(m) == "boolean" then moving = m end
+		end
 		self:RegisterEvent("PLAYER_SWING")
+		self:RegisterEvent("PLAYER_STARTED_MOVING")
 		self:RegisterEvent("START_AUTOREPEAT_SPELL")
 		self:RegisterEvent("STOP_AUTOREPEAT_SPELL")
 		self:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -1069,6 +1402,7 @@ driver:SetScript("OnEvent", function(self, event, ...)
 		self:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 		self:RegisterEvent("UI_SCALE_CHANGED")
 		self:RegisterEvent("DISPLAY_SIZE_CHANGED")
+		if ns.ApplyDisplay then ns.ApplyDisplay() end
 	elseif event == "ADDON_LOADED" then
 		if not shotSpell then
 			if _G.SwingTimerRangedFrame then
@@ -1077,6 +1411,7 @@ driver:SetScript("OnEvent", function(self, event, ...)
 			end
 		elseif Attach() then
 			self:UnregisterEvent("ADDON_LOADED")
+			if ns.ApplyDisplay then ns.ApplyDisplay() end -- a display on the game's bar can find it now
 		end
 	elseif event == "PLAYER_SWING" then
 		OnSwing(...)
@@ -1089,7 +1424,12 @@ driver:SetScript("OnEvent", function(self, event, ...)
 		autoRepeat = ReadAutoRepeat()
 		if autoRepeat ~= true then StopWaiting() end
 		ApplyLook()
+	elseif event == "PLAYER_STARTED_MOVING" then
+		moving = true
+		ApplyLook()
 	elseif event == "PLAYER_STOPPED_MOVING" then
+		moving = false
+		ApplyLook()
 		ShotPending()
 	elseif event == "UNIT_SPELLCAST_FAILED_QUIET" then
 		local _, _, spellID = ...

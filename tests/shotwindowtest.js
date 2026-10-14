@@ -13,6 +13,7 @@
 //
 //   node tests/shotwindowtest.js [--verbose]
 //   SHOTWINDOW_LUA=<path> node tests/shotwindowtest.js   (check another copy of the file)
+//   DISPLAYS_LUA=<path> node tests/shotwindowtest.js     (another copy of Displays.lua)
 //
 // Window styles: Styles.lua and ShotWindow_Skins.lua load after ShotWindow.lua with the same
 // namespace, as the TOC lists them. A scenario can run Lua before the files load (its third
@@ -27,9 +28,27 @@
 // fired by the tests, InCombatLockdown() answers T.combat, and Settings.OpenToCategory is refused
 // for addon code in combat. The red zone's own alpha (its pulse) is logged per SetAlpha call.
 //
+// Displays (Displays.lua): frame:CreateLine gives Line regions that record their two points and
+// thickness (T.noLines takes CreateLine away, so the square fallback runs), PlaySound records each
+// call in T.sounds, IsPlayerMoving answers T.moving, and every renderer made is listed in
+// T.renderers so a scenario can look a design's regions up by key (T.rend, T.part, T.rect).
+// T.dragFrame drags a frame that takes the mouse and is registered for dragging.
+//
+// Blizzard art on the round designs: C_Texture.GetAtlasInfo answers the swing timer's atlases
+// (file 8344036, texcoords from the 2x atlas members; T.atlasMode "missing", "nil" or "error" for
+// the fallbacks), and a Line records SetTexture, SetTexCoord and SetVertexColor and counts its
+// SetStartPoint calls (startCalls), so a scenario can tell a strip laid out again from one left be.
+//
+// Seamless strips: a texture has SetVertexOffset (each corner's offset recorded, calls counted per
+// texture and in T.vertexOffsetCalls), so the round designs draw their curves as textures whose
+// corners sit on the circles; T.quadCorners(texture) gives the four corners in the frame's units.
+// T.noVertexOffset (set before login) takes SetVertexOffset away, and the scenarios written for
+// the Line strips set it, so the Line fallback stays covered. SetSnapToPixelGrid and
+// SetTexelSnappingBias record their value and count their calls (T.noPixelSnap takes them away).
+//
 // Secrets: secret(v) hands out a stand-in that the trap below holds to the client's rules, but only
-// for code loaded from ShotWindow.lua (stub and test code stand in for the client and may touch
-// secrets). Following https://warcraft.wiki.gg/wiki/Secret_Values, tainted code may NOT compare a
+// for code loaded from ShotWindow.lua and Displays.lua (stub and test code stand in for the client
+// and may touch secrets). Following https://warcraft.wiki.gg/wiki/Secret_Values, tainted code may NOT compare a
 // secret (==, ~=, <, <=, also against nil), do arithmetic on it, index it, call it, take its length,
 // use it as a table key, or truth-test a secret BOOLEAN; it MAY store and pass secrets, truth-test a
 // non-boolean secret (always true), concatenate secret strings and numbers, and format them. A
@@ -47,6 +66,8 @@ const ADDON_SOURCE = '@' + ADDON_FILE;
 const ADDON_SRC = fs.readFileSync(process.env.SHOTWINDOW_LUA || path.join(ROOT, ADDON_FILE), 'utf8');
 const STYLES_SRC = fs.readFileSync(path.join(ROOT, 'Styles.lua'), 'utf8');
 const SKINS_SRC = fs.readFileSync(path.join(ROOT, 'ShotWindow_Skins.lua'), 'utf8');
+// DISPLAYS_LUA=<file> does the same for Displays.lua.
+const DISPLAYS_SRC = fs.readFileSync(process.env.DISPLAYS_LUA || path.join(ROOT, 'Displays.lua'), 'utf8');
 
 function findFengari() {
   const tries = [];
@@ -88,12 +109,15 @@ let SEEN = new Map();      // allowed uses by the addon, for the report
 let L = null;              // the state being run
 const isSecretTV = (tv) => !!tv && tv.type === LUA_TTABLE && BOX.has(tv.value);
 
+// The files held to the client's rules: the clock and the displays that read it.
+const TRAPPED = new Set([ADDON_SOURCE, '@Displays.lua']);
 function addonWhere(state) {
   for (let ci = state && state.ci; ci; ci = ci.previous) {
     const f = ci.func && ci.func.value;
     if (f && f.p) {
-      if (to_jsstring(f.p.source.getstr()) !== ADDON_SOURCE) return null;
-      return ADDON_FILE + ':' + (f.p.lineinfo[ci.l_savedpc - 1] || '?');
+      const src = to_jsstring(f.p.source.getstr());
+      if (!TRAPPED.has(src)) return null;
+      return src.slice(1) + ':' + (f.p.lineinfo[ci.l_savedpc - 1] || '?');
     }
   }
   return null;
@@ -117,7 +141,7 @@ function allowed(state, what) {
 function addonOnStack(state) {
   for (let ci = state && state.ci; ci; ci = ci.previous) {
     const f = ci.func && ci.func.value;
-    if (f && f.p && to_jsstring(f.p.source.getstr()) === ADDON_SOURCE) return true;
+    if (f && f.p && TRAPPED.has(to_jsstring(f.p.source.getstr()))) return true;
   }
   return false;
 }
@@ -275,9 +299,56 @@ setmetatable(C_Spell, { __index = function(_, k)
   if k == "IsAutoRepeatSpell" and T.autoRepMode ~= "missing" then return isAutoRepeatSpell end
   if k == "IsSpellInRange" then return isSpellInRange end
 end })
+-- C_Texture.GetAtlasInfo (TextureUtilsDocumentation.lua: AtlasInfo, MayReturnNothing): the swing
+-- timer's atlases as Forever has them, all in file 8344036 (512x256, atlas 4237), placed after the
+-- 2x members in UiTextureAtlasMember. T.atlasMode picks how the client answers: "plain" (the
+-- default) gives the AtlasInfo; "filename" gives it with the file as info.filename; "missing" leaves
+-- the function out; "nil" answers nothing; "error" raises. Displays.lua looks the atlases up once a
+-- session, so set the mode before login. Every
+-- query is listed in T.atlasQueries; T.atlasCoords(name) gives the member's l, r, t, b texcoords.
+T.atlasFile, T.atlasMode, T.atlasQueries = 8344036, "plain", {}
+T.atlasRects = { -- left, top, right, bottom, in pixels of the 512x256 file
+  ["ui-swingtimerbar-frame"] = { 1, 1, 427, 31 },
+  ["ui-swingtimerbar-background"] = { 1, 33, 423, 59 },
+  ["ui-swingtimerbar-filling-ranged"] = { 1, 109, 419, 131 },
+  ["ui-swingtimerbar-pip"] = { 1, 156, 11, 210 },
+}
+function T.atlasCoords(name)
+  local p = T.atlasRects[name]
+  return p[1] / 512, p[3] / 512, p[2] / 256, p[4] / 256
+end
+local function getAtlasInfo(name)
+  T.atlasQueries[#T.atlasQueries + 1] = name
+  if T.atlasMode == "error" then error("GetAtlasInfo: test failure") end
+  if T.atlasMode == "nil" then return nil end
+  local p = T.atlasRects[name]
+  if not p then return nil end
+  local l, r, t, b = T.atlasCoords(name)
+  local info = { elementName = name, width = (p[3] - p[1]) / 2, height = (p[4] - p[2]) / 2,
+    rawSize = { x = p[3] - p[1], y = p[4] - p[2] },
+    leftTexCoord = l, rightTexCoord = r, topTexCoord = t, bottomTexCoord = b,
+    tilesHorizontally = false, tilesVertically = false, file = T.atlasFile }
+  -- "filename": the file named the way Blizzard's NineSlice also reads it (info.filename), no file.
+  if T.atlasMode == "filename" then info.file, info.filename = nil, T.atlasFile end
+  return info
+end
+C_Texture = setmetatable({}, { __index = function(_, k)
+  if k == "GetAtlasInfo" and T.atlasMode ~= "missing" then return getAtlasInfo end
+end })
 -- In combat (T.combat) the client refuses to open its options panel for an addon.
 T.combat = false
 function InCombatLockdown() return T.combat == true end
+-- IsPlayerMoving answers T.moving (read at login); PLAYER_STARTED/STOPPED_MOVING are fired by tests.
+T.moving = false
+function IsPlayerMoving() return T.moving == true end
+-- PlaySound(soundKitID, channel) records every call; SOUNDKIT has the ids of the kits the addon names.
+T.sounds = {}
+SOUNDKIT = { IG_MAINMENU_OPTION_CHECKBOX_ON = 856, MAP_PING = 3175, READY_CHECK = 8960, RAID_WARNING = 8959 }
+function PlaySound(id, channel)
+  if realType(id) ~= "number" then error("PlaySound: bad argument #1 (number expected)", 2) end
+  T.sounds[#T.sounds + 1] = { id = id, channel = channel }
+  return true, #T.sounds
+end
 function GetNetStats() return T.net[1], T.net[2], T.net[3], T.net[4] end
 function GetCVar(name) return T.cvars[name] end
 DEFAULT_CHAT_FRAME = { AddMessage = function(_, m) T.prints[#T.prints + 1] = m end }
@@ -376,6 +447,21 @@ local LabelMeta = strict(Label, "FontString")
 function Label:GetFont() return "Fonts\\FRIZQT__.TTF", 10, "" end
 function Label:SetFont(path) self.fontFile = path end
 function Label:SetTextColor(r, g, b) self.textColor = { r, g, b } end
+-- Font strings the addon makes on the swing bar itself (the late-shot readout).
+function Label:SetPoint(...) local pts = rawget(self, "points") or {} pts[#pts + 1] = { ... } rawset(self, "points", pts) end
+function Label:SetText(t) rawset(self, "text", t) end
+function Label:GetText() return rawget(self, "text") end
+function Label:Show() rawset(self, "shown", true) end
+function Label:Hide() rawset(self, "shown", false) end
+function Label:IsShown() return rawget(self, "shown") == true end
+function Frame:CreateFontString(name, layer, template)
+  local fs = setmetatable({ layer = layer or false, template = template or false, shown = true }, LabelMeta)
+  local list = rawget(self, "fontStrings") or {}
+  list[#list + 1] = fs
+  rawset(self, "fontStrings", list)
+  return fs
+end
+function T.lateLabel() local list = rawget(T.bar, "fontStrings") return list and list[1] end
 function T.makeSwing(name, width)
   local frame = strictFrame("Frame", name, UIParent)
   frame.Background = blizzardTexture("ui-swingtimerbar-background")
@@ -507,7 +593,11 @@ T.templates = { MinimalSliderTemplate = true, UISliderTemplate = true, OptionsSl
   UIPanelButtonTemplate = true, ButtonFrameTemplate = true, BasicFrameTemplateWithInset = true,
   UIPanelCloseButton = true }
 T.fonts = { GameFontNormal = true, GameFontNormalLarge = true, GameFontNormalSmall = true,
-  GameFontHighlight = true, GameFontHighlightSmall = true, GameFontDisableSmall = true }
+  GameFontHighlight = true, GameFontHighlightSmall = true, GameFontDisableSmall = true,
+  GameFontNormalHuge = true, GameFontHighlightLarge = true }
+-- Font objects the displays take a font file from (FontInstance:GetFont: file, height, flags).
+GameFontNormalHuge = { GetFont = function() return "Fonts\\FRIZQT__.TTF", 20, "" end }
+GameFontHighlightLarge = { GetFont = function() return "Fonts\\FRIZQT__.TTF", 16, "" end }
 T.unknown, T.buttonArt, T.sizeDirty = {}, {}, {}
 T.blocked, T.hideCalls = 0, 0
 
@@ -560,6 +650,9 @@ local function metaFor(kind)
   if not metas[kind] then
     local t = M[kind]
     metas[kind] = { __index = function(self, k)
+      if k == "CreateLine" and T.noLines then return nil end -- a client without Line regions
+      if k == "SetVertexOffset" and T.noVertexOffset then return nil end -- nor vertex offsets
+      if (k == "SetSnapToPixelGrid" or k == "SetTexelSnappingBias") and T.noPixelSnap then return nil end -- nor pixel snapping
       local m = t[k]
       if m ~= nil then return m end
       if realType(k) == "string" and k:find("^%u") then
@@ -609,12 +702,50 @@ function TX:SetVertexColor(r, g, b, a) self.vertex = { r, g, b, a or 1 } end
 function TX:GetVertexColor() local v = rawget(self, "vertex") or { 1, 1, 1, 1 } return v[1], v[2], v[3], v[4] end
 function TX:SetTexture(file)
   self.file = file
+  self.textureCalls = (rawget(self, "textureCalls") or 0) + 1
   if realType(file) == "string" and file:lower():find("interface\\buttons", 1, true) then
     if file:lower():find("white8x8", 1, true) then T.flatArt = (T.flatArt or 0) + 1
     else T.buttonArt[#T.buttonArt + 1] = file end
   end
 end
 function TX:SetAtlas(atlas) self.atlas = atlas end
+-- Texture:SetVertexOffset(vertexIndex, offsetX, offsetY) moves one corner of the texture's box:
+-- 1 upper left, 2 lower left, 3 upper right, 4 lower right (UPPER_LEFT_VERTEX .. LOWER_RIGHT_VERTEX),
+-- x right and y up. Each corner's offset is kept in vertexOffsets[index] = { x, y }; calls are
+-- counted per texture (vertexOffsetCalls) and in all (T.vertexOffsetCalls). T.noVertexOffset takes
+-- the method away (set it before the renderer is made), so the Line fallback runs.
+function TX:SetVertexOffset(index, x, y)
+  if realType(index) ~= "number" or not (index == 1 or index == 2 or index == 3 or index == 4) then
+    error("Texture:SetVertexOffset(): vertex index 1 to 4 expected, got " .. tostring(index), 2)
+  end
+  if realType(x) ~= "number" or realType(y) ~= "number" or x ~= x or y ~= y then
+    error("Texture:SetVertexOffset(): bad offset (numbers expected): " .. tostring(x) .. ", " .. tostring(y), 2)
+  end
+  local off = rawget(self, "vertexOffsets")
+  if not off then off = {} rawset(self, "vertexOffsets", off) end
+  off[index] = { x, y }
+  self.vertexOffsetCalls = (rawget(self, "vertexOffsetCalls") or 0) + 1
+  T.vertexOffsetCalls = (T.vertexOffsetCalls or 0) + 1
+end
+-- TextureBase:SetSnapToPixelGrid(snap) and SetTexelSnappingBias(bias): the value is kept
+-- (snapToPixelGrid, texelBias), calls are counted per texture (snapCalls, texelBiasCalls) and in all
+-- (T.snapCalls, T.texelBiasCalls), and snapAt / texelAt keep the texture's vertexOffsetCalls at its
+-- first call, so a scenario can tell snapping was turned off before the corners were first moved.
+-- T.noPixelSnap takes both methods away (a client without them).
+function TX:SetSnapToPixelGrid(snap)
+  if realType(snap) ~= "boolean" then error("TextureBase:SetSnapToPixelGrid(): boolean expected, got " .. tostring(snap), 2) end
+  if rawget(self, "snapAt") == nil then self.snapAt = rawget(self, "vertexOffsetCalls") or 0 end
+  self.snapToPixelGrid = snap
+  self.snapCalls = (rawget(self, "snapCalls") or 0) + 1
+  T.snapCalls = (T.snapCalls or 0) + 1
+end
+function TX:SetTexelSnappingBias(bias)
+  if realType(bias) ~= "number" or bias ~= bias then error("TextureBase:SetTexelSnappingBias(): number expected, got " .. tostring(bias), 2) end
+  if rawget(self, "texelAt") == nil then self.texelAt = rawget(self, "vertexOffsetCalls") or 0 end
+  self.texelBias = bias
+  self.texelBiasCalls = (rawget(self, "texelBiasCalls") or 0) + 1
+  T.texelBiasCalls = (T.texelBiasCalls or 0) + 1
+end
 function TX:SetDrawLayer(layer, sub) self.layer, self.sublevel = layer, sub end
 function TX:GetDrawLayer() return self.layer, self.sublevel end
 
@@ -704,6 +835,8 @@ function B:RegisterForClicks(...) self.clicks = { ... } end
 function B:Enable() self.enabled = true end
 function B:Disable() self.enabled = false end
 function B:IsEnabled() return rawget(self, "enabled") ~= false end
+function B:LockHighlight() self.highlightLocked = true end
+function B:UnlockHighlight() self.highlightLocked = false end
 function B:SetNormalFontObject(f) self.font = f end
 function B:GetFontString() return rawget(self, "fs") end
 function B:SetFontString(fs) self.fs = fs end
@@ -776,11 +909,91 @@ do
   M.Texture.IsObjectType = function(_, what) return what == "Texture" end
   M.Texture.SetGradient = function(self, orient, a, b) self.gradient = { orient, a, b } end
   M.Texture.SetRotation = function(self, r) self.rotation = r end
-  M.Texture.SetTexCoord = function(self, ...) self.texCoord = { ... } end
+  M.Texture.SetTexCoord = function(self, ...) self.texCoord, self.texCoordArgs = { ... }, select("#", ...) end
   M.Texture.GetNumMaskTextures = function() return 0 end
   M.FontString.IsObjectType = function(_, what) return what == "FontString" end
   M.FontString.GetFont = function(self) return "Fonts\\FRIZQT__.TTF", 12, "" end
-  M.FontString.SetFont = function(self, path, size, flags) self.fontFile = path return true end
+  M.FontString.SetFont = function(self, path, size, flags) -- a font file set counts as a font
+    self.fontFile, self.fontSize, self.fontFlags = path, size, flags
+    if not rawget(self, "font") then self.font = path end
+    self.fontCalls = (rawget(self, "fontCalls") or 0) + 1
+    return true
+  end
+end
+
+-- Line regions (frame:CreateLine): a texture between two anchor points, of some thickness.
+local LN = methods("Line", "Texture")
+-- A Line counts how often it is laid out (SetStartPoint), and records the art it wears: SetTexture
+-- (file, counted), SetTexCoord (left, right, top, bottom; the 8 number form is the client's too,
+-- texCoordArgs says which was used) and SetVertexColor.
+function LN:SetStartPoint(point, rel, x, y)
+  self.startPoint = { point, rel, x or 0, y or 0 }
+  self.startCalls = (rawget(self, "startCalls") or 0) + 1
+end
+function LN:SetTexture(file)
+  self.file = file
+  self.textureCalls = (rawget(self, "textureCalls") or 0) + 1
+end
+function LN:SetTexCoord(...)
+  local n = select("#", ...)
+  if n ~= 4 and n ~= 8 then error("Line:SetTexCoord(): 4 or 8 numbers expected, got " .. n, 2) end
+  for i = 1, n do
+    if realType((select(i, ...))) ~= "number" then error("Line:SetTexCoord(): bad argument #" .. i .. " (number expected)", 2) end
+  end
+  self.texCoord, self.texCoordArgs = { ... }, n
+end
+function LN:SetVertexColor(r, g, b, a)
+  if realType(r) ~= "number" or realType(g) ~= "number" or realType(b) ~= "number" or (a ~= nil and realType(a) ~= "number") then
+    error("Line:SetVertexColor(): numbers expected", 2)
+  end
+  self.vertex = { r, g, b, a or 1 }
+end
+function LN:SetEndPoint(point, rel, x, y) self.endPoint = { point, rel, x or 0, y or 0 } end
+function LN:GetStartPoint() local p = rawget(self, "startPoint") if p then return p[1], p[2], p[3], p[4] end end
+function LN:GetEndPoint() local p = rawget(self, "endPoint") if p then return p[1], p[2], p[3], p[4] end end
+function LN:SetThickness(t)
+  if realType(t) ~= "number" then error("Line:SetThickness(): number expected", 2) end
+  self.thickness = t
+end
+function LN:GetThickness() return rawget(self, "thickness") or 1 end
+LN.IsObjectType = function(_, what) return what == "Line" or what == "Texture" end
+do
+  local function createLine(self, name, layer, inherits, sublevel)
+    local l = setmetatable({ parent = self, kind = "Line", layer = layer or "ARTWORK", sublevel = sublevel or 0,
+      shown = true, points = {}, width = 0, height = 0 }, metaFor("Line"))
+    local list = rawget(self, "lines")
+    if not list then list = {} rawset(self, "lines", list) end
+    list[#list + 1] = l
+    if name then _G[name] = l end
+    return l
+  end
+  -- Where a frame's center is, for frames placed by their CENTER on UIParent or another stub frame.
+  local function getCenter(self)
+    if self == UIParent then return self.width / 2, self.height / 2 end
+    local p = self.points[1]
+    if not p or p[1] ~= "CENTER" then return nil end
+    local rel = p[2]
+    if realType(rel) ~= "table" or not (rel == UIParent or rawget(rel, "ui")) then return nil end
+    local rx, ry = getCenter(rel)
+    if not rx then return nil end
+    local relp, w, h = p[3] or "CENTER", rel.width or 0, rel.height or 0
+    if relp == "BOTTOMLEFT" then rx, ry = rx - w / 2, ry - h / 2
+    elseif relp == "TOPLEFT" then rx, ry = rx - w / 2, ry + h / 2
+    elseif relp ~= "CENTER" then return nil end
+    return rx + (p[4] or 0), ry + (p[5] or 0)
+  end
+  for _, kind in ipairs({ "Frame", "Button", "CheckButton", "Slider", "ColorSelect" }) do
+    local t = M[kind]
+    t.CreateLine = createLine
+    t.GetCenter = getCenter
+    t.GetNumRegions = function(self) return #self.textures + #self.fontStrings + #(rawget(self, "lines") or {}) end
+    local regions = t.GetRegions
+    t.GetRegions = function(self)
+      local list = { regions(self) }
+      for _, l in ipairs(rawget(self, "lines") or {}) do list[#list + 1] = l end
+      return table.unpack(list)
+    end
+  end
 end
 function CreateColor(r, g, b, a) return { r = r, g = g, b = b, a = a } end
 GameTooltip = { lines = {} }
@@ -1168,11 +1381,20 @@ local function hasText(f, text)
   for _, fs in ipairs(rawget(f, "fontStrings") or {}) do if rawget(fs, "text") == text then return true end end
   return false
 end
+-- The controls sit on pages (Zone, Display, Alerts) inside the content; the content is the root.
 function T.contents()
   local list = {}
-  for _, f in ipairs(T.frames) do if rawget(f, "ui") and hasText(f, "Timing") then list[#list + 1] = f end end
+  for _, f in ipairs(T.frames) do
+    if rawget(f, "ui") and hasText(f, "Timing") then
+      local root = rawget(f, "parent")
+      if root and rawget(root, "pages") then f = root end
+      list[#list + 1] = f
+    end
+  end
   return list
 end
+function T.pages() local c = T.content() return c and rawget(c, "pages") or {} end
+function T.tab(i) local c = T.content() return c and rawget(c, "tabs")[i] end
 function T.content() local list = T.contents() return list[#list] end
 local function find(kind, test)
   local root = T.content()
@@ -1193,9 +1415,13 @@ end
 function T.button(text) return find("Button", function(f) return rawget(f, "text") == text end) end
 function T.status()
   local c = T.content()
-  for _, fs in ipairs(c and c.fontStrings or {}) do
-    local t = rawget(fs, "text")
-    if t and t:find("^Red zone now") then return t end
+  local where = { c }
+  for _, page in ipairs(T.pages()) do where[#where + 1] = page end
+  for _, f in ipairs(where) do
+    for _, fs in ipairs(f and f.fontStrings or {}) do
+      local t = rawget(fs, "text")
+      if t and t:find("^Red zone now") then return t end
+    end
   end
 end
 function T.window() return rawget(_G, "ShotWindowOptions") end
@@ -1235,6 +1461,81 @@ function checkControls(label, want)
     check(got == want[name], label .. ": " .. name .. " " .. want[name] .. " (got " .. got .. ")")
   end
 end
+
+-- The displays (Displays.lua). T.renderers lists every renderer made (filled by a wrapper round
+-- NS.NewRenderer, put in place as the files load); a renderer keeps its regions by "design:key".
+function T.rend() -- the free display's renderer
+  local holder = rawget(_G, "ShotWindowDisplay")
+  if not holder then return nil end
+  for _, r in ipairs(T.renderers or {}) do if rawget(r.frame, "parent") == holder then return r end end
+end
+function T.part(r, key) -- the region a design keeps under key: a texture, a font string or a segment
+  if not r or not r.design then return nil end
+  local name = r.design .. ":" .. key
+  local s = r.segs[name]
+  return r.tex[name] or r.texts[name] or (s and (s.line or s.tex))
+end
+function T.isShown(region) return region ~= nil and rawget(region, "shown") == true end
+-- A rectangle the displays lay out from the frame's TOPLEFT: x0, x1, y0, y1 (y down), or nil when hidden.
+function T.rect(t)
+  if not T.isShown(t) then return nil end
+  local p = t.points[1]
+  if #t.points ~= 1 or p[1] ~= "TOPLEFT" or p[3] ~= "TOPLEFT" then return "bad anchors" end
+  return p[4], p[4] + t.width, -p[5], -p[5] + t.height
+end
+-- A segment's two ends (x right, y up from the frame's BOTTOMLEFT): from a Line, or the square's
+-- center and size when there are no Line regions.
+function T.segEnds(region)
+  if not T.isShown(region) then return nil end
+  if rawget(region, "kind") == "Line" then
+    local a, b = region.startPoint, region.endPoint
+    if not (a and b) or a[1] ~= "BOTTOMLEFT" or b[1] ~= "BOTTOMLEFT" then return "bad anchors" end
+    return a[3], a[4], b[3], b[4]
+  end
+  local p = region.points[1]
+  if not p or p[1] ~= "CENTER" or p[3] ~= "BOTTOMLEFT" then return "bad anchors" end
+  return p[4], p[5], p[4], p[5], region.width
+end
+-- A texture whose corners were moved with SetVertexOffset (the seamless strips): its four corners
+-- in the frame's units (x right, y up from the frame's BOTTOMLEFT), in the client's order: 1 upper
+-- left, 2 lower left, 3 upper right, 4 lower right, each { x, y }. A corner is where the texture's
+-- box puts it (one CENTER anchor on its frame's BOTTOMLEFT, and its size) plus that vertex's
+-- offset. nil when hidden; a string when the texture is not anchored that way.
+function T.quadCorners(t)
+  if not T.isShown(t) then return nil end
+  local p = t.points[1]
+  if #t.points ~= 1 or p[1] ~= "CENTER" or p[3] ~= "BOTTOMLEFT" or p[2] ~= rawget(t, "parent") then return "bad anchors" end
+  local hw, hh = (rawget(t, "width") or 0) / 2, (rawget(t, "height") or 0) / 2
+  local x, y = p[4] or 0, p[5] or 0
+  local box = { { x - hw, y + hh }, { x - hw, y - hh }, { x + hw, y + hh }, { x + hw, y - hh } }
+  local off = rawget(t, "vertexOffsets") or {}
+  local out = {}
+  for i = 1, 4 do
+    local o = off[i] or { 0, 0 }
+    out[i] = { box[i][1] + o[1], box[i][2] + o[2] }
+  end
+  return out
+end
+function T.shownParts(r, design)
+  local n = 0
+  for _, region in ipairs(r.parts[design or r.design] or {}) do if T.isShown(region) then n = n + 1 end end
+  return n
+end
+-- The preview boxes in the options (one on the Display page, one on the Alerts page).
+function T.preview(page)
+  for _, f in ipairs(T.frames) do
+    if rawget(f, "renderer") and isDescendant(f, page) then return f end
+  end
+end
+-- The player drags a frame: only one that takes the mouse and is registered for dragging gets it.
+function T.dragFrame(f, dx, dy)
+  if rawget(f, "mouse") ~= true or not rawget(f, "drag") or not f:IsVisible() then return false end
+  local x, y = f:GetCenter()
+  fireScript(f, "OnDragStart", "LeftButton")
+  if rawget(f, "moving") and x then f.points = { { "CENTER", UIParent, "BOTTOMLEFT", x + dx, y + dy } } end
+  fireScript(f, "OnDragStop")
+  return true
+end
 `;
 
 // ---------------------------------------------------------------------------------------------
@@ -1260,13 +1561,15 @@ function loadAddon(S) {
   if (lua.lua_pcall(S, 2, 0, 0) !== 0) return lua.lua_tojsstring(S, -1);
   const drv = exec(S, 'T.driver = T.frames[#T.frames]', '=test');
   if (drv) return drv;
-  for (const [src, name] of [[STYLES_SRC, '@Styles.lua'], [SKINS_SRC, '@ShotWindow_Skins.lua']]) {
+  for (const [src, name] of [[STYLES_SRC, '@Styles.lua'], [DISPLAYS_SRC, '@Displays.lua'], [SKINS_SRC, '@ShotWindow_Skins.lua']]) {
     if (lauxlib.luaL_loadbuffer(S, to_luastring(src), null, to_luastring(name)) !== 0) return lua.lua_tojsstring(S, -1);
     lua.lua_pushstring(S, to_luastring('ShotWindow'));
     lua.lua_getglobal(S, to_luastring('NS'));
     if (lua.lua_pcall(S, 2, 0, 0) !== 0) return name + ': ' + lua.lua_tojsstring(S, -1);
   }
-  return null;
+  // Every renderer the displays make is listed, so scenarios can find a design's regions by key.
+  return exec(S, 'T.renderers = {} local made = NS.NewRenderer if made then NS.NewRenderer = function(parent) ' +
+    'local r = made(parent) T.renderers[#T.renderers + 1] = r return r end end', '=test');
 }
 
 // The trap must work before anything it says can be trusted.
@@ -1492,15 +1795,15 @@ scenario('/shotwindow debug, garbage and empty input', String.raw`
   T.login(200)
   T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
   T.slash("debug")
-  check(T.said("version 0.2.1"), "debug: version")
+  check(T.said("version 0.3.0"), "debug: version")
   check(T.said("bar found: true, showSwingTimer: 1"), "debug: bar and cvar")
   check(T.said("swing: 2.8 s (weapon 2.8 s)"), "debug: swing line")
   check(T.said("red zone: last 0.50 s = window 0.50 s + latency 0 ms + extra 0 ms"), "debug: red zone line")
   local n = #T.prints
   T.slash("garbage words")
-  check(#T.prints == n + 6 and T.said("/shotwindow window <seconds>") and T.said("/shotwindow debug"), "garbage shows usage")
+  check(#T.prints == n + 8 and T.said("/shotwindow window <seconds>") and T.said("/shotwindow debug"), "garbage shows usage")
   T.slash("help")
-  check(#T.prints == n + 12, "help shows usage (" .. (#T.prints - n) .. ")")
+  check(#T.prints == n + 16, "help shows usage (" .. (#T.prints - n) .. ")")
   checkBands("unchanged by debug/usage", 200, 2.8, 0.5, 0)
   check(#T.errors == 0, "no errors")
 `);
@@ -1875,7 +2178,7 @@ scenario('options: switching category and back; a small canvas scales the contro
   T.closePanel()
   T.canvas:SetSize(500, 400)
   T.slash("")
-  local want = math.min(1, 488 / 600, 350 / 532)
+  local want = math.min(1, 488 / 600, (400 - 10 - 8) / 562) -- tabs share the title line
   check(near(c:GetScale(), want), "scaled to fit (" .. tostring(c:GetScale()) .. ", want " .. want .. ")")
   T.update(0.016)
   check(near(c:GetScale(), want) and c:IsVisible(), "refit on OnSizeChanged")
@@ -2789,20 +3092,24 @@ scenario('options: labels click too (hit rects), swatches sit under the checkbox
   check(#T.errors == 0, "no errors")
 `);
 
-scenario('options: every control fits above the Defaults row (CONTENT_H 532)', String.raw`
+scenario('options: every control on every page fits above the Defaults row (CONTENT_H 562)', String.raw`
   T.login(200)
   T.slash("")
   local c = T.content()
-  check(c.height == 532, "content 532 high (" .. tostring(c.height) .. ")")
+  check(c.height == 562, "content 562 high (" .. tostring(c.height) .. ")")
   local reset = T.button("Defaults")
   local rp = reset.points[1]
   local resetTop = -(c.height - rp[3] - reset.height)
   local lowest, what = 0, nil
-  for _, f in ipairs(c.children) do
-    local p = f.points[1]
-    if f ~= reset and p and p[1] == "TOPLEFT" and type(p[2]) == "number" and type(p[3]) == "number" then
-      local bottom = p[3] - (f.height or 0)
-      if bottom < lowest then lowest, what = bottom, f end
+  check(#T.pages() == 3, "three pages")
+  for _, page in ipairs(T.pages()) do
+    local top = page.points[1][3]
+    for _, f in ipairs(page.children) do
+      local p = f.points[1]
+      if p and p[1] == "TOPLEFT" and type(p[2]) == "number" and type(p[3]) == "number" then
+        local bottom = top + p[3] - (f.height or 0)
+        if bottom < lowest then lowest, what = bottom, f end
+      end
     end
   end
   check(rp[1] == "BOTTOMLEFT" and lowest > resetTop, "lowest control bottom " .. tostring(lowest) .. " above the Defaults top " .. tostring(resetTop))
@@ -2941,17 +3248,25 @@ const STYLE_HELPERS = String.raw`
     end
     return false
   end
+  local function under(f, root)
+    local parent = rawget(f, "parent")
+    return parent == root or (parent and rawget(parent, "parent") == root and rawget(root, "pages") ~= nil)
+  end
   local function checkIn(root, label)
     for _, f in ipairs(T.frames) do
-      if f.kind == "CheckButton" and rawget(f, "parent") == root then
+      if f.kind == "CheckButton" and under(f, root) then
         for _, fs in ipairs(f.fontStrings) do if rawget(fs, "text") == label then return f end end
       end
     end
   end
   local function noteOf(c)
-    for _, fs in ipairs(c.fontStrings) do
-      local t = rawget(fs, "text")
-      if t and (t:find("^In use") or t:find("/reload", 1, true)) then return fs end
+    local where = { c }
+    for _, page in ipairs(rawget(c, "pages") or {}) do where[#where + 1] = page end
+    for _, f in ipairs(where) do
+      for _, fs in ipairs(f.fontStrings) do
+        local t = rawget(fs, "text")
+        if t and (t:find("^In use") or t:find("/reload", 1, true)) then return fs end
+      end
     end
   end
   local function backdrop(w)
@@ -2994,7 +3309,7 @@ scenario('styles: Blizzard by default draws nothing; the Look section on the pag
   T.slash("")
   local c = T.content()
   local b = T.button("Window style: Automatic")
-  check(b ~= nil and b:GetParent() == c, "style button names the style")
+  check(b ~= nil and under(b, c), "style button names the style")
   local note = noteOf(c)
   check(note and note.text == "In use: Blizzard (EllesmereUI is not loaded).", "note line (" .. tostring(note and note.text) .. ")")
   local holder = T.slider("Dark background opacity") and T.slider("Dark background opacity").parent
@@ -3043,7 +3358,7 @@ scenario('styles: Blizzard to Dark from the Look button draws at once; opacity l
   check(strokes == 2 and rawget(w.CloseButton.textures[1], "alpha") == 0, "close button drawn as an X over faded art")
   check(w.CloseButton:GetFrameLevel() >= 1, "close button raised")
   local cb = T.checkbox("Show the red zone")
-  check(cb:GetParent() == own and #cb.textures >= 7, "checkbox drawn (" .. #cb.textures .. " textures)")
+  check(under(cb, own) and #cb.textures >= 7, "checkbox drawn (" .. #cb.textures .. " textures)")
   check(cb.checkedTex.vertex and near(cb.checkedTex.vertex[1], 0.5) and near(cb.checkedTex.vertex[3], 1), "check mark in the accent")
   local thumb = T.slider("Zone opacity").thumb
   check(thumb.colorTex and near(thumb.colorTex[1], 0.5) and near(thumb.colorTex[2], 0.82) and rawget(thumb, "alpha") == 1, "slider thumb flat, in the accent")
@@ -3376,6 +3691,2882 @@ scenario('swing bars: a druid in Dark, the swing timer loading after login, gets
   local zone = 0
   for _, t in ipairs(T.bar.textures) do if t.layer == "ARTWORK" and t.sublevel >= 5 then zone = zone + 1 end end
   check(zone == 0, "and nothing of the zone")
+  check(#T.errors == 0, "no errors")
+`);
+
+// ---------------------------------------------------------------------------------------------
+// Displays and alerts (Displays.lua): designs drawn on a frame of our own, the call-out, the screen
+// edge, the sound, the late readout, and their options.
+
+// Lua helpers shared by the display scenarios.
+const DISPLAY_HELPERS = String.raw`
+  local SHOT, WHITE = { 1, 0.85, 0.35 }, { 1, 1, 1 }
+  local function close(a, b, tol) return type(a) == "number" and type(b) == "number" and math.abs(a - b) <= (tol or 0.01) end
+  local function num(v) if type(v) == "number" then return string.format("%.3f", v) end return tostring(v) end
+  local function rgbOf(t) return t and rawget(t, "colorTex") end
+  local function alphaOf(t) local c = rgbOf(t) return c and c[4] end
+  local function sameRGB(c, want)
+    return type(c) == "table" and type(want) == "table" and close(c[1], want[1], 1e-6) and close(c[2], want[2], 1e-6)
+      and close(c[3], want[3], 1e-6)
+  end
+  local function rgbStr(c)
+    if type(c) ~= "table" then return tostring(c) end
+    return string.format("%.2f,%.2f,%.2f", c[1] or c.r or -1, c[2] or c.g or -1, c[3] or c.b or -1)
+  end
+  local function mid(a, b) if type(a) == "number" and type(b) == "number" then return (a + b) / 2 end end
+  local function dist(x, y, cx, cy) if type(x) == "number" and type(y) == "number" then return math.sqrt((x - cx) ^ 2 + (y - cy) ^ 2) end end
+  local function pulseAt(age) return 0.6 + 0.4 * math.cos((age - 0.15) * math.pi * 2.5) end
+  local function grayOf(text) local b = T.button(text) return b and T.grayState(b) or "missing" end
+  local function buttonStarting(prefix) -- a visible button whose label starts with prefix
+    for i = #T.frames, 1, -1 do
+      local f = T.frames[i]
+      local t = rawget(f, "text")
+      if f.kind == "Button" and type(t) == "string" and t:sub(1, #prefix) == prefix and f:IsVisible() then return f end
+    end
+  end
+  local function textOn(frame, text)
+    for _, fs in ipairs(frame.fontStrings) do if rawget(fs, "text") == text then return fs end end
+  end
+`;
+
+// The scripted fight every design goes through, in one session: a ranged swing of 2.8 s (the zone
+// is the last 0.5 s, no latency), a tick before the zone, one inside it, moving inside it
+// (clipping), the bar running out with no shot (the hold), ticks past the 0.15 s grace while still
+// moving and after stopping (the pulse), the late shot (the flash and "+0.59"), then ticks.
+// Modes: "art" (Blizzard style, Line regions, GetAtlasInfo: the round designs wear the bar's art,
+// the states as a flat tint over it), "lines" (the same without GetAtlasInfo: every design flat),
+// "squares" (no CreateLine) and "dark" (the Dark style: flat).
+const FIGHT = String.raw`
+  local mode = FIGHT_MODE
+  local ART = mode == "art"
+  T.noVertexOffset = true -- the Line strips (the seamless strips have scenarios of their own)
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  if mode == "lines" then T.atlasMode = "missing" end
+  if mode == "squares" then T.noLines = true end
+  if mode == "dark" then ShotWindowDB = { style = "dark" } end
+  T.login(200)
+  if mode == "dark" then T.fire("PLAYER_ENTERING_WORLD") end
+  check(mode ~= "dark" or (NS.Styles.Applied() == "dark" and NS.Styles.S ~= nil), "Dark drawn")
+  local db = ShotWindowDB
+  local accent = mode == "dark" and { NS.Styles.S.GetAccentColor() } or nil
+  local moveC = accent or db.moveColor
+  check(NS.DISPLAYS[1] == "none" and #NS.DISPLAYS == 12, "twelve choices, none first (" .. #NS.DISPLAYS .. ")")
+  local K0 = math.ceil(((db.trackSeconds or 5) / 2) / 2.8) + 2 -- the rhythm track's next shot (k = 0)
+  local pipMid = math.floor(((db.pipCount or 11) + 1) / 2)
+  -- fill: the region in the fill color (moveFill before the zone, waitFill while holding);
+  -- flash: what turns the shot color as the shot fires; chrome: the frame drawn round it.
+  local SPEC = {
+    classic = { fill = "fill", flash = "spark", chrome = "hbar" },
+    pincer = { fill = "left", flash = "shot", chrome = "hbar" },
+    vpincer = { fill = "top", flash = "shot", chrome = "vbar" },
+    gap = { fill = "fill", waitFill = "dot", flash = "dot", chrome = "hbar" },
+    brackets = { fill = "lv", flash = "dot" },
+    pips = { fill = "p1", flash = "p" .. pipMid },
+    scanner = { fill = "spark", flash = "shot", chrome = "hbar" },
+    track = { fill = "z" .. K0, moveFill = "m" .. K0, chrome = "hbar" },
+    arc = { fill = "fl1", flash = "shot" },
+    ring = { fill = "f1", flash = "shot" },
+    reticle = { fill = "c1", flash = "dot" },
+  }
+  -- In the bar's art: the art fill strips (keys, segments each), and the tint laid over them.
+  local ARTSPEC = {
+    arc = { fill = { "Afl", "Afr" }, n = 22, tint = { "Atl", "Atr" } },
+    ring = { fill = { "Afill" }, n = 40, tint = { "Atint" } },
+    reticle = { fill = { "Acirc" }, n = 32, tint = { "Atint" } },
+  }
+  local function artOf(D) return ART and ARTSPEC[D] or nil end
+  -- How many of a strip's segments are shown, and how many wear the atlas file.
+  local function stripCount(r, keys, n)
+    local shown, art = 0, 0
+    for _, k in ipairs(keys) do
+      for i = 1, n do
+        local s = T.part(r, k .. i)
+        if T.isShown(s) then shown = shown + 1 end
+        if s and rawget(s, "file") == T.atlasFile then art = art + 1 end
+      end
+    end
+    return shown, art
+  end
+
+  local function chromeCheck(D, r, tag)
+    local c = r.chrome
+    if not c then check(false, tag .. "no frame made round the drawing") return end
+    local kind = SPEC[D].chrome
+    local shown, black, gold = 0, 0, 0
+    for i = 1, 4 do
+      local e = c.edges[i]
+      if T.isShown(e) then shown = shown + 1 end
+      if sameRGB(rgbOf(e), { 0, 0, 0 }) then black = black + 1 end
+      if sameRGB(rgbOf(e), { 0.8, 0.65, 0.3 }) then gold = gold + 1 end
+    end
+    if not kind then
+      check(not T.isShown(c.bg) and not T.isShown(c.art) and shown == 0, tag .. "no frame round a round or free-standing design")
+    elseif mode == "dark" then
+      check(T.isShown(c.bg) and rawget(c.bg, "atlas") == nil and close(alphaOf(c.bg), 0.9) and not T.isShown(c.art),
+        tag .. "Dark: a flat panel behind it, no atlas (atlas " .. tostring(rawget(c.bg, "atlas")) .. ")")
+      check(shown == 4 and black == 4, tag .. "Dark: a black outline (" .. shown .. " edges shown, " .. black .. " black)")
+    elseif kind == "hbar" then
+      check(T.isShown(c.bg) and rawget(c.bg, "atlas") == "ui-swingtimerbar-background" and T.isShown(c.art)
+        and rawget(c.art, "atlas") == "ui-swingtimerbar-frame", tag .. "Blizzard: the swing timer's own bar art round it")
+      check(shown == 0, tag .. "Blizzard: no outline over the art (" .. shown .. ")")
+    else -- the vertical pincer under Blizzard: the bar art is horizontal, so a flat track and a gold edge
+      check(T.isShown(c.bg) and rawget(c.bg, "atlas") == nil and close(alphaOf(c.bg), 0.7) and not T.isShown(c.art),
+        tag .. "Blizzard, standing bar: a flat track, no atlas")
+      check(shown == 4 and gold == 4, tag .. "Blizzard, standing bar: a gold edge (" .. shown .. " shown, " .. gold .. " gold)")
+    end
+  end
+
+  -- Holding for the shot: every design drawn at the shot point.
+  local function waitShape(D, r, W, H, fillC, age, when)
+    local tag = "[" .. D .. "] " .. when .. ": "
+    local function P(k) return T.part(r, k) end
+    local as = artOf(D)
+    if as then -- the bar's fill art full length, the tint over all of it
+      local want = #as.fill * as.n
+      local shown, art = stripCount(r, as.fill, as.n)
+      check(shown == want and art == want, tag .. "the whole fill shown in the bar's art (" .. shown .. " shown, " .. art .. " with the atlas file, of " .. want .. ")")
+      local tinted = stripCount(r, as.tint, as.n)
+      check(tinted == #as.tint * as.n, tag .. "the tint over all of it (" .. tinted .. " of " .. #as.tint * as.n .. ")")
+      if D == "reticle" then
+        local th = math.max(2, db.dispThick / 2)
+        local half = math.min(W, H) / 2
+        local rim = math.max(0, math.min(th * 30 / 22 * 1.4, half - th - 2 - 12))
+        local rmax = half - th - 2 - rim
+        local rmin = math.max(4, rmax * 0.12)
+        local x1, y1, x2, y2 = T.segEnds(P("Acirc1"))
+        local d1, d2 = dist(x1, y1, W / 2, H / 2), dist(x2, y2, W / 2, H / 2)
+        check(close(d1, rmin) and close(d2, rmin), tag .. "the circle closed to its smallest inside the rim (radius " .. num(d1) .. ", " .. num(d2) .. ", want " .. num(rmin) .. ")")
+        -- Never thicker than 0.8 of its radius, so it stays a ring as it closes.
+        local ct = math.min(th * 1.4, rmin * 0.8)
+        check(close(rawget(P("Acirc1"), "thickness"), ct, 1e-6), tag .. "circle art thickness " .. num(ct) .. " (" .. num(rawget(P("Acirc1"), "thickness")) .. ")")
+      elseif D == "ring" then
+        local count = P("count")
+        check(T.isShown(count) and rawget(count, "text") == "Late", tag .. "the countdown says Late (" .. tostring(count and rawget(count, "text")) .. ")")
+      else
+        local label = P("label")
+        check(T.isShown(label) and rawget(label, "text") == (when:find("moving", 1, true) and "Moving" or "Late"), tag .. "the label (" .. tostring(label and rawget(label, "text")) .. ")")
+      end
+      return
+    end
+    if D == "classic" then
+      local x0, x1 = T.rect(P("fill"))
+      check(close(x0, 0) and close(x1, W), tag .. "the fill reaches the end (x " .. num(x0) .. " to " .. num(x1) .. ", W " .. W .. ")")
+    elseif D == "pincer" then
+      local l0, l1 = T.rect(P("left"))
+      local r0, r1 = T.rect(P("right"))
+      check(close(l0, 0) and close(l1, W / 2), tag .. "the left fill reaches the middle (" .. num(l0) .. " to " .. num(l1) .. ")")
+      check(close(r0, W / 2) and close(r1, W), tag .. "the right fill starts at the middle (" .. num(r0) .. " to " .. num(r1) .. ")")
+    elseif D == "vpincer" then
+      local _, _, t0, t1 = T.rect(P("top"))
+      local _, _, b0, b1 = T.rect(P("bottom"))
+      check(close(t0, 0) and close(t1, H / 2), tag .. "the top fill reaches the middle (y " .. num(t0) .. " to " .. num(t1) .. ", H " .. H .. ")")
+      check(close(b0, H / 2) and close(b1, H), tag .. "the bottom fill starts at the middle (y " .. num(b0) .. " to " .. num(b1) .. ")")
+    elseif D == "gap" then
+      check(T.rect(P("fill")) == nil, tag .. "the bar has closed (fill hidden)")
+      local dot = P("dot")
+      check(T.isShown(dot) and close(mid(T.rect(dot)), W / 2), tag .. "a mark where it closed, at the middle")
+      check(close(alphaOf(dot), pulseAt(age), 1e-6), tag .. "the mark pulses (alpha " .. num(alphaOf(dot)) .. ", want " .. num(pulseAt(age)) .. ")")
+    elseif D == "brackets" then
+      local arm = math.max(4, H * 0.3)
+      local tip = W / 2 - 1
+      local _, lt1 = T.rect(P("lt"))
+      local rt0 = T.rect(P("rt"))
+      check(close(lt1, W / 2 - 1) and close(rt0, W / 2 + 1), tag .. "the bracket tips meet at the middle (" .. num(lt1) .. " and " .. num(rt0) .. ", W/2 " .. W / 2 .. ")")
+      local lv0, lv1 = T.rect(P("lv"))
+      check(close(lv0, tip - arm - 3) and close(lv1, tip - arm), tag .. "the left upright stands an arm behind its tip (" .. num(lv0) .. " to " .. num(lv1) .. ")")
+      local rv0, rv1 = T.rect(P("rv"))
+      check(close(rv0, W - (tip - arm)) and close(rv1, W - (tip - arm) + 3), tag .. "the right upright mirrors it (" .. num(rv0) .. " to " .. num(rv1) .. ")")
+    elseif D == "pips" then
+      local bad = {}
+      for i = 1, db.pipCount do
+        if i ~= pipMid then
+          local t = P("p" .. i)
+          if not (T.rect(t) and sameRGB(rgbOf(t), fillC)) then bad[#bad + 1] = i .. "=" .. rgbStr(rgbOf(t)) end
+        end
+      end
+      check(#bad == 0, tag .. "every side pip lit in the fill color " .. rgbStr(fillC) .. " (not: " .. table.concat(bad, " ") .. ")")
+    elseif D == "scanner" then
+      local x = mid(T.rect(P("spark")))
+      check(close(x, W / 2), tag .. "the spark stops on the shot line (x " .. num(x) .. ", W/2 " .. W / 2 .. ")")
+    elseif D == "track" then
+      local x = mid(T.rect(P("s" .. K0)))
+      check(close(x, W / 2), tag .. "the due shot's tick sits on the now line (x " .. num(x) .. ")")
+      check(close(mid(T.rect(P("now"))), W / 2), tag .. "the now line in the middle")
+    elseif D == "arc" or D == "ring" then
+      local keys, n = D == "arc" and { "fl", "fr" } or { "f" }, D == "arc" and 22 or 40
+      local hidden, kinds = 0, 0
+      for _, k in ipairs(keys) do
+        for i = 1, n do
+          local s = P(k .. i)
+          if not T.isShown(s) then hidden = hidden + 1 end
+          if s and (rawget(s, "kind") == "Line") == (mode ~= "squares") then kinds = kinds + 1 end
+        end
+      end
+      check(hidden == 0, tag .. "every fill segment shown (" .. hidden .. " hidden)")
+      check(kinds == #keys * n, tag .. (mode == "squares" and "squares stand in for the segments" or "the segments are Line regions"))
+      if D == "ring" then
+        local count = P("count")
+        check(T.isShown(count) and rawget(count, "text") == "Late", tag .. "the countdown says Late (" .. tostring(count and rawget(count, "text")) .. ")")
+      else
+        local label = P("label")
+        check(T.isShown(label) and rawget(label, "text") == (when:find("moving", 1, true) and "Moving" or "Late"), tag .. "the label (" .. tostring(label and rawget(label, "text")) .. ")")
+      end
+    elseif D == "reticle" then
+      local th = math.max(2, (db.dispThick or 8) / 2)
+      local rmax = math.min(W, H) / 2 - th - 2
+      local rmin = math.max(4, rmax * 0.12)
+      local x1, y1, x2, y2 = T.segEnds(P("c1"))
+      if mode == "squares" then
+        local d, want = dist(x1, y1, W / 2, H / 2), rmin * math.cos(math.pi / 32)
+        check(close(d, want), tag .. "the circle closed to its smallest (square at " .. num(d) .. " from the center, want " .. num(want) .. ")")
+      else
+        local d1, d2 = dist(x1, y1, W / 2, H / 2), dist(x2, y2, W / 2, H / 2)
+        check(close(d1, rmin) and close(d2, rmin), tag .. "the circle closed to its smallest (radius " .. num(d1) .. ", " .. num(d2) .. ", want " .. num(rmin) .. ")")
+        local ct = math.min(th, rmin * 0.8) -- never thicker than 0.8 of its radius
+        check(close(rawget(P("c1"), "thickness"), ct, 1e-6), tag .. "circle line thickness " .. num(ct) .. " (" .. num(rawget(P("c1"), "thickness")) .. ")")
+      end
+    end
+  end
+
+  local function flashCheck(D, r, W, on, tag)
+    local function P(k) return T.part(r, k) end
+    if D == "track" then
+      if not on then return end
+      local tick
+      for i = 1, (r.trackMax or 0) do
+        local t = P("s" .. i)
+        if T.rect(t) and close(mid(T.rect(t)), W / 2, 0.5) then tick = t end
+      end
+      check(tick ~= nil and sameRGB(rgbOf(tick), SHOT), tag .. "the shot that just fired sits on the now line")
+      check(tick ~= nil and close(alphaOf(tick), 1, 1e-6), tag .. "and flashes (alpha " .. num(alphaOf(tick)) .. ", want 1 as the shot fires)")
+      return
+    end
+    local key = SPEC[D].flash
+    local t = P(key)
+    if on then
+      check(T.isShown(t) and sameRGB(rgbOf(t), SHOT), tag .. "the shot flashes: " .. key .. " in the shot color (" .. rgbStr(rgbOf(t)) .. ")")
+      if D == "reticle" then check(t and t.width == 8, tag .. "the center dot grows to 8 (" .. tostring(t and t.width) .. ")") end
+    elseif D == "gap" then
+      check(not T.isShown(t), tag .. "flash over: the mark hidden while the bar is open")
+    elseif D == "reticle" then
+      check(t and t.width == 4, tag .. "flash over: the center dot back to 4")
+    else
+      check(T.isShown(t) and sameRGB(rgbOf(t), WHITE), tag .. "flash over: " .. key .. " white again (" .. rgbStr(rgbOf(t)) .. ")")
+    end
+  end
+
+  local prev
+  for index, D in ipairs(NS.DISPLAYS) do
+    if D ~= "none" then
+      local tag = "[" .. D .. "] "
+      local errs = #T.errors
+      local base = 100 + index * 20
+      T.slash("display " .. D)
+      local holder, r = rawget(_G, "ShotWindowDisplay"), T.rend()
+      check(holder ~= nil and holder:IsShown() and r ~= nil and r.design == D, tag .. "the display shows this design")
+      if r then
+        local spec = SPEC[D]
+        local function P(k) return T.part(r, k) end
+        local W, H = NS.DisplaySize(db, D)
+        check(r.w == W and r.h == H and holder.width == W and holder.height == H, tag .. "drawn at " .. W .. "x" .. H)
+
+        T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+        T.now = base + 1.0 T.update()
+        check(rawget(r.frame, "alpha") == 1, tag .. "visible while Auto Shot is on")
+        if prev then check(T.shownParts(r, prev) == 0, tag .. "nothing of " .. prev .. " left shown (" .. T.shownParts(r, prev) .. ")") end
+        check(T.shownParts(r) >= 3, tag .. "regions shown (" .. T.shownParts(r) .. ")")
+        chromeCheck(D, r, tag)
+        local as = artOf(D)
+        check(r.mode == (as and "art" or "flat"), tag .. "drawn " .. (as and "in the bar's art" or "flat") .. " (" .. tostring(r.mode) .. ")")
+        local f
+        if as then
+          -- Moving is free: no tint, the art's own fill shows, at the fill's alpha.
+          f = P(as.tint[1] .. "1")
+          local art = P(as.fill[1] .. "1")
+          local v = art and rawget(art, "vertex")
+          check(not T.isShown(f), tag .. "before the zone: no tint over the fill")
+          check(T.isShown(art) and rawget(art, "file") == T.atlasFile and v and close(v[1], 1, 1e-9) and close(v[2], 1, 1e-9)
+            and close(v[3], 1, 1e-9) and close(v[4], 0.95, 1e-9), tag .. "before the zone: the bar's fill art shows, untinted (vertex " .. rgbStr(v) .. " alpha " .. num(v and v[4]) .. ")")
+        else
+          f = P(spec.moveFill or spec.fill)
+          check(T.isShown(f) and sameRGB(rgbOf(f), moveC), tag .. "before the zone: the fill in the move color"
+            .. (accent and " (the style's accent)" or "") .. " (" .. rgbStr(rgbOf(f)) .. ", want " .. rgbStr(moveC) .. ")")
+        end
+
+        -- The tint is 0.55 of the pulse over the art; a flat fill is the whole color.
+        local tintK = as and 0.55 or 1
+        T.now = base + 2.4 T.update()
+        f = as and P(as.tint[1] .. "1") or P(spec.fill)
+        check(T.isShown(f) and sameRGB(rgbOf(f), db.color), tag .. "inside the zone: the fill in the zone color (" .. rgbStr(rgbOf(f)) .. ")")
+        if as then check(close(alphaOf(f), 0.55, 1e-9), tag .. "inside the zone: the tint at 0.55 (" .. num(alphaOf(f)) .. ")") end
+
+        T.now = base + 2.5 T.fire("PLAYER_STARTED_MOVING") T.update()
+        check(T.isShown(f) and sameRGB(rgbOf(f), db.clipColor), tag .. "moving inside the zone: the fill in the clip color (" .. rgbStr(rgbOf(f)) .. ")")
+
+        local waitAt = base + 2.81
+        T.now = waitAt T.update()
+        check(T.stateHas("waiting for a late shot"), tag .. "the bar ran out: holding for the shot")
+        T.now = base + 3.0 T.update()
+        waitShape(D, r, W, H, db.clipColor, T.now - waitAt, "holding, still moving")
+        local wf = as and P(as.tint[1] .. "1") or P(spec.waitFill or spec.fill)
+        local wantA = (D == "track" and db.activeAlpha or tintK) * pulseAt(T.now - waitAt)
+        check(T.isShown(wf) and sameRGB(rgbOf(wf), db.clipColor), tag .. "holding, still moving: the clip color (" .. rgbStr(rgbOf(wf)) .. ")")
+        check(close(alphaOf(wf), wantA, 1e-6), tag .. "holding past the grace: pulsing (alpha " .. num(alphaOf(wf)) .. ", want " .. num(wantA) .. ")")
+        check(T.shownParts(r) >= 3, tag .. "regions shown while holding (" .. T.shownParts(r) .. ")")
+
+        T.now = base + 3.1 T.fire("PLAYER_STOPPED_MOVING")
+        T.now = base + 3.25 T.update()
+        waitShape(D, r, W, H, db.color, T.now - waitAt, "holding, standing")
+        wantA = (D == "track" and db.activeAlpha or tintK) * pulseAt(T.now - waitAt)
+        check(T.isShown(wf) and sameRGB(rgbOf(wf), db.color), tag .. "holding, standing: the zone color (" .. rgbStr(rgbOf(wf)) .. ")")
+        check(close(alphaOf(wf), wantA, 1e-6), tag .. "holding, standing: still pulsing (alpha " .. num(alphaOf(wf)) .. ", want " .. num(wantA) .. ")")
+
+        T.now = base + 3.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+        flashCheck(D, r, W, true, tag .. "the late shot: ")
+        local lateFS = holder.fontStrings[2]
+        check(lateFS:IsShown() and rawget(lateFS, "text") == "+0.59" and sameRGB(lateFS.textColor, db.clipColor),
+          tag .. "the late readout under the display (" .. tostring(rawget(lateFS, "text")) .. ")")
+        check(not T.lateLabel():IsShown(), tag .. "not on the game's bar while a display shows it")
+        T.now = base + 4.0 T.update()
+        flashCheck(D, r, W, false, tag .. "0.6 s later: ")
+        T.now = base + 4.95 T.update()
+        check(not lateFS:IsShown(), tag .. "the late readout gone 1.5 s after the shot")
+        check(T.debugSays("display: " .. NS.DISPLAY_NAMES[D] .. ", locked, shown, " .. (mode == "squares" and "squares" or "lines")),
+          tag .. "debug: the display line")
+        if NS.ROUND_DISPLAYS[D] and mode ~= "squares" then
+          local why = ART and "Blizzard art" or (mode == "dark" and "flat (a drawn window style)" or "flat (no atlas info)")
+          check(T.debugSays("display: " .. NS.DISPLAY_NAMES[D] .. ", locked, shown, lines, " .. why .. ", line strips"), tag .. "debug: " .. why .. ", line strips")
+        end
+      end
+      check(#T.errors == errs, tag .. "no Lua errors (" .. (#T.errors - errs) .. ")")
+      prev = D
+    end
+  end
+  check(#T.errors == 0, "no errors")
+`;
+
+for (const [mode, label] of [['art', 'Blizzard style: the round designs in the bar\'s art'], ['lines', 'Line regions, no atlas info: all flat'],
+  ['squares', 'no CreateLine: squares stand in'], ['dark', 'Dark style']]) {
+  scenario('displays: every design through one fight (' + label + '; Line strips): move, zone, clipping, hold, pulse, late shot', DISPLAY_HELPERS + 'local FIGHT_MODE = "' + mode + '"\n' + FIGHT);
+}
+
+scenario('alerts: the call-out says Go, Stop, Moving, Late, nothing idle; the screen edge tints, in the clip color while clipping', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { callout = true, edge = true }
+  T.login(200)
+  local db = ShotWindowDB
+  local co, edge = rawget(_G, "ShotWindowCallout"), rawget(_G, "ShotWindowEdge")
+  check(co ~= nil and edge ~= nil, "call-out and edge frames made at login")
+  check(rawget(_G, "ShotWindowDisplay") == nil, "no display frame for display none")
+  local fs = co.fontStrings[1]
+  local function say() return co:IsShown() and rawget(fs, "text") or nil end
+  check(co.points[1][1] == "BOTTOM" and co.points[1][2] == SwingTimerRangedFrame and co.points[1][3] == "TOP" and co.points[1][5] == 14, "with no display the call-out sits above the game's bar")
+  check(fs.fontFile == "Fonts\\FRIZQT__.TTF" and fs.fontSize == 26 and fs.fontFlags == "OUTLINE", "a big outlined font at the chosen size (" .. tostring(fs.fontFile) .. " " .. tostring(fs.fontSize) .. ")")
+  local top = edge.textures[1]
+  check(edge.mouse == false and edge.strata == "BACKGROUND" and edge.points[1][1] == "ALL" and edge.points[1][2] == UIParent, "the edge covers the screen behind everything and never takes the mouse")
+  T.update()
+  check(say() == nil and not edge:IsShown(), "idle: no words, no edge")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 100.2 T.update()
+  check(say() == "Go" and sameRGB(fs.textColor, db.moveColor), "just after a shot: Go, in the move color (" .. tostring(say()) .. ")")
+  T.now = 101.0 T.update()
+  check(say() == nil and not edge:IsShown(), "before the zone: nothing (" .. tostring(say()) .. ")")
+  T.now = 102.4 T.update()
+  check(say() == "Stop" and sameRGB(fs.textColor, db.color), "inside the zone: Stop, in the zone color (" .. tostring(say()) .. ")")
+  check(edge:IsShown() and close(edge.alpha, 0.6), "inside the zone: the edge shows (alpha " .. tostring(edge.alpha) .. ")")
+  local g = rawget(top, "gradient")
+  check(g and g[1] == "VERTICAL" and sameRGB({ g[3].r, g[3].g, g[3].b }, db.color) and close(g[3].a, 0.9) and close(g[2].a, 0), "the top edge in the zone color, fading inward")
+  check(close(top.height, 90) and close(edge.textures[3].width, 90), "edge bands 90 px")
+  T.now = 102.5 T.fire("PLAYER_STARTED_MOVING") T.update()
+  check(say() == "Moving" and sameRGB(fs.textColor, db.clipColor), "moving inside the zone: Moving, in the clip color (" .. tostring(say()) .. ")")
+  g = rawget(top, "gradient")
+  check(edge:IsShown() and close(edge.alpha, 0.85) and g and sameRGB({ g[3].r, g[3].g, g[3].b }, db.clipColor), "the edge in the clip color while clipping (" .. rgbStr(g and g[3]) .. ")")
+  local side = rawget(edge.textures[3], "gradient")
+  check(side and side[1] == "HORIZONTAL" and close(side[2].a, 0.9) and close(side[3].a, 0), "the left edge fades to the right")
+  T.now = 102.81 T.update()
+  T.now = 103.0 T.update()
+  check(say() == "Moving", "the bar ran out while moving: still Moving (" .. tostring(say()) .. ")")
+  T.now = 103.1 T.fire("PLAYER_STOPPED_MOVING")
+  T.now = 103.25 T.update()
+  local p = pulseAt(103.25 - 102.81)
+  check(say() == "Late" and sameRGB(fs.textColor, db.color) and close(fs.textColor[4], p, 1e-6), "standing, the shot late: Late, pulsing (" .. tostring(say()) .. ", alpha " .. num(fs.textColor[4]) .. ")")
+  g = rawget(top, "gradient")
+  check(edge:IsShown() and close(edge.alpha, 0.7 * p, 1e-6) and sameRGB({ g[3].r, g[3].g, g[3].b }, db.color), "the edge pulses in the zone color (alpha " .. num(edge.alpha) .. ")")
+  T.now = 103.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+  check(say() == "Go", "the late shot fires: Go (" .. tostring(say()) .. ")")
+  T.now = 103.75 T.update() check(say() == "Go", "Go for 0.4 s")
+  T.now = 103.85 T.update() check(say() == nil and not edge:IsShown(), "then nothing (" .. tostring(say()) .. ")")
+  T.fire("STOP_AUTOREPEAT_SPELL")
+  T.now = 106.21 T.update()
+  check(T.stateHas("idle") and say() == nil and not edge:IsShown(), "Auto Shot off and the swing over: idle, nothing")
+  T.now = 110 T.fire("START_AUTOREPEAT_SPELL") T.update()
+  check(say() == "Stop", "the first shot's wind-up: Stop (" .. tostring(say()) .. ")")
+  T.now = 110.6 T.update()
+  check(say() == "Stop" and close(edge.alpha, 0.6), "the first shot's wait past the grace: still Stop, not Late (" .. tostring(say()) .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('alerts: moving at login (IsPlayerMoving) counts as clipping inside the zone; warnMove off never clips', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.moving = true
+  ShotWindowDB = { callout = true }
+  T.login(200)
+  local co = ShotWindowCallout
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.4 T.update()
+  check(co:IsShown() and co.fontStrings[1].text == "Moving", "seeded moving: Moving inside the zone (" .. tostring(co.fontStrings[1].text) .. ")")
+  check(sameRGB(T.tex().stand.color, ShotWindowDB.clipColor), "the zone on the game's bar in the clip color")
+  ShotWindowDB.warnMove = false
+  T.slash("flash") T.slash("flash")
+  T.now = 102.5 T.update()
+  check(co.fontStrings[1].text == "Stop" and sameRGB(T.tex().stand.color, ShotWindowDB.color), "warnMove off: Stop, the zone color")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('alerts: the late readout shows under the display, not on the bar, and goes after 1.5 s; on the bar with display none', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "classic" }
+  T.login(200)
+  local db = ShotWindowDB
+  local holder = ShotWindowDisplay
+  local lateFS, bar = holder.fontStrings[2], T.lateLabel()
+  check(lateFS.points[1][1] == "TOPRIGHT" and lateFS.points[1][2] == holder and lateFS.points[1][3] == "BOTTOMRIGHT", "under the display's right end")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.81 T.update()
+  T.now = 103.0 T.update()
+  check(not lateFS:IsShown() and not bar:IsShown(), "nothing before a late shot")
+  T.now = 103.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+  check(lateFS:IsShown() and lateFS.text == "+0.59" and sameRGB(lateFS.textColor, db.clipColor), "+0.59 in the clip color under the display (" .. tostring(lateFS.text) .. ")")
+  check(not bar:IsShown(), "not on the game's bar")
+  T.now = 104.85 T.update() check(lateFS:IsShown(), "still up 1.45 s after the shot")
+  T.now = 104.95 T.update() check(not lateFS:IsShown(), "gone 1.55 s after the shot")
+  T.now = 106.21 T.update()
+  T.now = 106.26 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+  check(not lateFS:IsShown(), "a shot 0.05 s after the bar ends is report jitter, not late")
+  -- display none: the readout goes on the game's bar
+  T.slash("display none")
+  check(not holder:IsShown(), "display none hides the display")
+  T.now = 109.07 T.update()
+  T.now = 109.5 T.fire("PLAYER_SWING", 2.8, 2)
+  check(bar:IsShown() and bar:GetText() == "+0.43" and sameRGB(bar.textColor, db.clipColor), "display none: +0.43 on the game's bar (" .. tostring(bar:GetText()) .. ")")
+  T.now = 110.9 T.update() check(bar:IsShown(), "still up 1.4 s after the shot")
+  T.now = 111.05 T.update() check(not bar:IsShown(), "gone 1.55 s after the shot")
+  -- lateText off: nowhere
+  db.lateText = false
+  T.now = 112.31 T.update()
+  T.now = 112.9 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+  check(not bar:IsShown(), "lateText off: not on the bar")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('alerts: the late readout on the game bar goes 1.5 s after the shot even when that swing ends sooner (Auto Shot stopped)', DISPLAY_HELPERS + String.raw`
+  -- A hasted 1.2 s swing after a late shot, then the target dies (STOP_AUTOREPEAT_SPELL): the swing
+  -- ends 1.2 s after the shot with nothing to wait for.
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local bar = T.lateLabel()
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.81 T.update()
+  T.now = 103.4 T.fire("PLAYER_SWING", 1.2, 2)
+  check(bar:IsShown() and bar:GetText() == "+0.59", "the late shot's delay on the bar (" .. tostring(bar:GetText()) .. ")")
+  T.now = 103.5 T.fire("STOP_AUTOREPEAT_SPELL")
+  T.now = 104.0 T.update()
+  T.now = 104.61 T.update()
+  check(T.stateHas("idle"), "the swing is over and nothing is held")
+  T.now = 105.0 T.update()
+  T.now = 106.0 T.update()
+  check(not bar:IsShown(), "2.6 s after the shot the delay is gone from the bar (still showing " .. tostring(bar:GetText()) .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('alerts: a sound once per swing as the zone starts, in the chosen kit; none for the first shot\'s wait', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", false
+  ShotWindowDB = { sound = true, soundKit = 2 }
+  T.login(200)
+  T.update()
+  check(#T.sounds == 0, "nothing at login")
+  T.now = 100 T.fire("START_AUTOREPEAT_SPELL")
+  for k = 1, 5 do T.now = 100 + k * 0.1 T.update() end
+  check(T.stateHas("waiting") and #T.sounds == 0, "the first shot's wind-up (a wait with no swing) plays nothing (" .. #T.sounds .. ")")
+  T.now = 100.6 T.fire("PLAYER_SWING", 2.8, 2)
+  for k = 1, 22 do T.now = 100.6 + k * 0.1 T.update() end
+  check(#T.sounds == 0, "nothing before the zone (" .. #T.sounds .. ")")
+  T.now = 102.95 T.update()
+  check(#T.sounds == 1 and T.sounds[1].id == SOUNDKIT.MAP_PING and T.sounds[1].channel == "Master", "one sound as the zone starts: Ping, on Master (" .. #T.sounds .. ", " .. tostring(T.sounds[1] and T.sounds[1].id) .. ")")
+  T.now = 103.0 T.fire("PLAYER_STARTED_MOVING") T.update()
+  T.now = 103.2 T.fire("PLAYER_STOPPED_MOVING") T.update()
+  T.now = 103.41 T.update()
+  for k = 1, 6 do T.now = 103.41 + k * 0.1 T.update() end
+  check(T.stateHas("waiting") and #T.sounds == 1, "nothing more for moving, stopping or holding for the late shot (" .. #T.sounds .. ")")
+  T.now = 104.1 T.fire("PLAYER_SWING", 2.8, 2)
+  for k = 1, 28 do T.now = 104.1 + k * 0.1 T.update() end
+  check(#T.sounds == 2, "once more in the next swing (" .. #T.sounds .. ")")
+  ShotWindowDB.soundKit = 4
+  T.now = 106.95 T.fire("PLAYER_SWING", 2.8, 2)
+  for k = 1, 28 do T.now = 106.95 + k * 0.1 T.update() end
+  check(#T.sounds == 3 and T.sounds[3].id == SOUNDKIT.RAID_WARNING, "the kit chosen now is the one played (" .. tostring(T.sounds[3] and T.sounds[3].id) .. ")")
+  ShotWindowDB.sound = false
+  T.now = 109.8 T.fire("PLAYER_SWING", 2.8, 2)
+  for k = 1, 28 do T.now = 109.8 + k * 0.1 T.update() end
+  check(#T.sounds == 3, "sound off: nothing (" .. #T.sounds .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('display frame: faded out when locked and idle; shown in combat, with Auto Shot on, or a swing or wait running; always and unlocked show it', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", false
+  ShotWindowDB = { display = "classic" }
+  T.login(200)
+  local holder, r = rawget(_G, "ShotWindowDisplay"), T.rend()
+  check(holder and holder:IsShown() and r and r.design == "classic", "made and shown at login from the saved choice")
+  check(holder.strata == "MEDIUM" and rawget(holder, "parent") == UIParent, "on UIParent, MEDIUM strata")
+  local lateFS = holder.fontStrings[2]
+  local function a() return rawget(r.frame, "alpha") end
+  T.update()
+  check(a() == 0 and lateFS.alpha == 0, "locked, out of combat, Auto Shot off, no swing: faded out (" .. tostring(a()) .. ")")
+  check(holder:IsShown(), "the frame itself stays shown")
+  T.combat = true T.update()
+  check(a() == 1 and lateFS.alpha == 1, "in combat: shown")
+  T.combat = false T.update()
+  check(a() == 0, "out of combat again: faded")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+  check(a() == 1, "a swing running: shown")
+  T.now = 102.81 T.update()
+  check(a() == 0 and T.stateHas("idle"), "the swing over with Auto Shot off: faded")
+  T.now = 103 T.fire("START_AUTOREPEAT_SPELL") T.update()
+  check(a() == 1, "Auto Shot turned on (the first shot's wait): shown")
+  T.now = 103.2 T.fire("STOP_AUTOREPEAT_SPELL") T.update()
+  check(a() == 0, "Auto Shot off: faded")
+  T.autoRep[75] = true
+  T.fire("PLAYER_ENTERING_WORLD") T.update()
+  check(T.stateHas("auto-repeat true, idle") and a() == 1, "Auto Shot on with nothing running: shown")
+  T.autoRep[75] = false
+  T.fire("PLAYER_ENTERING_WORLD") T.update()
+  check(a() == 0, "off again: faded")
+  ShotWindowDB.dispAlways = true T.update()
+  check(a() == 1, "Show out of combat too: always shown")
+  ShotWindowDB.dispAlways = false T.update()
+  check(a() == 0, "and faded again without it")
+  T.slash("unlock") T.update()
+  check(a() == 1, "unlocked: shown, to be placed")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('display frame: none makes nothing; a design makes and shows it; none hides it again', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  T.update()
+  check(rawget(_G, "ShotWindowDisplay") == nil, "display none: no frame made")
+  check(T.debugSays("display: None (marks on the game's bar only), alerts: warnMove lateText"), "debug: display none")
+  T.slash("display classic")
+  local holder = rawget(_G, "ShotWindowDisplay")
+  check(holder and holder:IsShown() and T.said("display: Classic bar"), "classic: made and shown")
+  T.slash("display none")
+  check(not holder:IsShown(), "none: hidden")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  check(not holder:IsShown(), "stays hidden through a swing")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('display frame and alerts: never for a class without Auto Shot or a wand, whatever is saved', DISPLAY_HELPERS + String.raw`
+  T.className, T.class = "Warrior", "WARRIOR"
+  ShotWindowDB = { display = "classic", callout = true, edge = true, sound = true }
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  for k = 1, 30 do T.now = 100 + k * 0.1 T.update() end
+  T.slash("display pips")
+  check(ShotWindowDB.display == "classic" and T.said("the stand-still zone is for hunters and wand users"), "/shotwindow display answers with what applies")
+  T.slash("unlock")
+  check(ShotWindowDB.dispLocked == true, "/shotwindow unlock does nothing")
+  check(rawget(_G, "ShotWindowDisplay") == nil and rawget(_G, "ShotWindowCallout") == nil and rawget(_G, "ShotWindowEdge") == nil, "no display, call-out or edge made")
+  check(#T.sounds == 0, "no sound")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('displays: a wand user (priest) gets the display and the alerts on Shoot', DISPLAY_HELPERS + String.raw`
+  T.className, T.class = "Priest", "PRIEST"
+  T.autoRepMode, T.autoRep[5019] = "plain", true
+  ShotWindowDB = { display = "pincer", callout = true }
+  T.login(200)
+  local r = T.rend()
+  check(ShotWindowDisplay and ShotWindowDisplay:IsShown() and r and r.design == "pincer", "the display for Shoot")
+  T.now = 100 T.fire("PLAYER_SWING", 1.5, 2)
+  T.now = 101.2 T.update()
+  check(ShotWindowCallout:IsShown() and ShotWindowCallout.fontStrings[1].text == "Stop", "Stop inside the wand's zone")
+  T.now = 101.51 T.update() T.now = 101.8 T.update()
+  local _, x1 = T.rect(T.part(r, "left"))
+  check(close(x1, r.w / 2), "held at the shot after the wand's swing (" .. num(x1) .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('display frame: unlock shows the outline and hint and takes the mouse; a drag saves the spot; Reset position; on the game bar; lock', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "classic", callout = true }
+  T.login(200)
+  local db = ShotWindowDB
+  local holder = ShotWindowDisplay
+  local outline, hint = holder.textures[1], holder.fontStrings[1]
+  local p = holder.points[1]
+  check(#holder.points == 1 and p[1] == "CENTER" and p[2] == UIParent and p[3] == "CENTER" and p[4] == 0 and p[5] == -180, "first placed 180 below the middle")
+  check(ShotWindowCallout.points[1][2] == holder and ShotWindowCallout.points[1][3] == "TOP", "the call-out sits above the display")
+  check(not outline:IsShown() and not hint:IsShown() and holder.mouse == false, "locked: no outline, no hint, mouse off")
+  check(not T.dragFrame(holder, 50, 50) and db.dispPos == nil, "locked: cannot be dragged")
+  T.slash("unlock")
+  check(db.dispLocked == false and T.said("display unlocked: drag it, then /shotwindow lock"), "/shotwindow unlock")
+  check(outline:IsShown() and hint:IsShown() and hint.text == "Shot Window: drag to move, then /shotwindow lock" and holder.mouse == true, "unlocked: outline, hint, takes the mouse")
+  check(holder.movable == true and holder.drag and holder.drag[1] == "LeftButton" and holder.clamped == true, "movable with the left button, kept on screen")
+  check(T.dragFrame(holder, 100, 50) and holder.moving == false, "dragged and let go")
+  local pos = db.dispPos
+  check(type(pos) == "table" and close(pos[1], 100) and close(pos[2], -130), "the spot saved from the middle of the screen (" .. num(pos and pos[1]) .. ", " .. num(pos and pos[2]) .. ")")
+  p = holder.points[1]
+  check(#holder.points == 1 and p[1] == "CENTER" and p[2] == UIParent and p[3] == "CENTER" and close(p[4], 100) and close(p[5], -130), "and placed there by its middle")
+  T.slash("lock")
+  check(db.dispLocked == true and T.said("display locked") and not outline:IsShown() and not hint:IsShown() and holder.mouse == false, "/shotwindow lock")
+  T.slash("display pips")
+  p = holder.points[1]
+  check(close(p[4], 100) and close(p[5], -130), "the saved spot kept for another design")
+  T.slash("")
+  T.click(T.tab(2))
+  T.click(T.button("Reset position"))
+  p = holder.points[1]
+  check(db.dispPos == nil and p[2] == UIParent and p[4] == 0 and p[5] == -180, "Reset position: back to the first spot")
+  T.click(T.checkbox("Lock in place"))
+  check(db.dispLocked == false and holder.mouse == true and outline:IsShown(), "Lock in place unchecked: unlocked")
+  T.click(T.checkbox("Sit on the game's swing bar"))
+  p = holder.points[1]
+  check(db.dispOnBar == true and #holder.points == 1 and p[1] == "CENTER" and p[2] == SwingTimerRangedFrame and p[3] == "CENTER", "on the game's bar: centered on SwingTimerRangedFrame")
+  check(holder.mouse == false and not outline:IsShown() and not hint:IsShown(), "on the bar: fixed, never takes the mouse")
+  check(not T.dragFrame(holder, 30, 30), "on the bar: cannot be dragged")
+  checkControls("on the bar", { ["Lock in place"] = "grayed", ["Sit on the game's swing bar"] = "usable" })
+  check(grayOf("Reset position") == "grayed", "Reset position grayed on the bar")
+  check(T.debugSays("display: Pips, on the game's bar, shown"), "debug: on the game's bar")
+  T.click(T.checkbox("Sit on the game's swing bar"))
+  p = holder.points[1]
+  check(db.dispOnBar == false and p[2] == UIParent and holder.mouse == true, "off the bar: free again, still unlocked")
+  T.click(T.checkbox("Lock in place"))
+  check(db.dispLocked == true and holder.mouse == false, "Lock in place checked: locked")
+  check(T.debugSays("display: Pips, locked, shown, lines"), "debug: locked")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('display: /shotwindow display <name>, display alone steps on, unknown names listed; usage and debug', DISPLAY_HELPERS + String.raw`
+  T.login(200)
+  T.slash("display")
+  check(ShotWindowDB.display == "classic" and T.said("display: Classic bar"), "display alone: the next design (" .. tostring(ShotWindowDB.display) .. ")")
+  T.slash("display")
+  check(ShotWindowDB.display == "pincer", "and the next")
+  T.slash("display Reticle")
+  check(ShotWindowDB.display == "reticle" and T.said("display: Tightening reticle") and T.rend().design == "reticle", "by name, any case")
+  T.slash("display")
+  check(ShotWindowDB.display == "none" and not ShotWindowDisplay:IsShown(), "after the last: none")
+  T.slash("display blob")
+  check(ShotWindowDB.display == "none" and T.said("displays: none, classic, pincer, vpincer, gap, brackets, pips, scanner, track, arc, ring, reticle"), "an unknown name lists them")
+  T.slash("help")
+  check(T.said("/shotwindow display [none|classic|pincer|vpincer|gap|brackets|pips|scanner|track|arc|ring|reticle]  - a display of its own (now none)"), "usage lists the designs")
+  check(T.said("/shotwindow lock | unlock  - fix or move that display"), "usage: lock and unlock")
+  T.slash("display gap")
+  check(T.debugSays("display: Closing gap, locked, shown, lines, alerts: warnMove lateText"), "debug: the display line")
+  ShotWindowDB.callout, ShotWindowDB.sound = true, true
+  T.slash("unlock")
+  check(T.debugSays("display: Closing gap, unlocked, shown, lines, alerts: warnMove lateText callout sound"), "debug: unlocked, the alerts listed")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('options: three tabs, Zone first; a tab shows its page, the mark and highlight follow; the tab is kept on reopening', DISPLAY_HELPERS + String.raw`
+  T.login(200)
+  T.slash("")
+  local pages = T.pages()
+  check(#pages == 3 and T.tab(1).text == "Zone" and T.tab(2).text == "Display" and T.tab(3).text == "Alerts", "Zone, Display, Alerts")
+  local function on(i)
+    for k = 1, 3 do
+      if pages[k]:IsShown() ~= (k == i) then return false end
+      if T.tab(k).swMark:IsShown() ~= (k == i) then return false end
+      if rawget(T.tab(k), "highlightLocked") ~= (k == i) then return false end
+    end
+    return pages[i]:IsVisible()
+  end
+  check(on(1), "Zone first")
+  check(T.checkbox("Show the red zone"):IsVisible() and not T.checkbox("Lock in place"):IsVisible(), "only the Zone page's controls")
+  T.click(T.tab(2))
+  check(on(2), "Display: its page, the mark under its tab")
+  check(T.checkbox("Lock in place"):IsVisible() and not T.checkbox("Show the red zone"):IsVisible(), "only the Display page's controls")
+  T.click(T.tab(3))
+  check(on(3) and T.checkbox("Say Stop, Moving, Late and Go"):IsVisible(), "Alerts")
+  T.closePanel()
+  T.slash("")
+  check(on(3), "reopened on the Alerts page")
+  T.click(T.tab(1))
+  check(on(1), "back to Zone")
+  check(T.button("Defaults"):IsVisible(), "Defaults under every page")
+  check(#T.errors == 0, "no errors")
+`);
+
+for (const [mode, label] of [['lines', 'Line regions'], ['squares', 'no CreateLine']]) {
+  scenario('options: the Design button steps through every design, right click back; the preview draws each without errors (' + label + ')', DISPLAY_HELPERS + 'T.noLines = ' + (mode === 'squares') + '\n' + String.raw`
+    T.autoRepMode, T.autoRep[75] = "plain", true
+    T.login(200)
+    T.slash("")
+    T.click(T.tab(2))
+    local db = ShotWindowDB
+    local page = T.pages()[2]
+    local box = T.preview(page)
+    check(box ~= nil and box:IsVisible() and box.width == 270 and box.height == 150, "a 270x150 preview on the Display page")
+    local r = box.renderer
+    local lateFS = box.children[1].fontStrings[2]
+    local design = buttonStarting("Design: ")
+    check(design and design.text == "Design: None (marks on the game's bar only)", "the Design button names the choice (" .. tostring(design and design.text) .. ")")
+    check(textOn(page, NS.DISPLAY_NOTES.none) ~= nil, "the note under it")
+    local list = NS.DISPLAYS
+    for i = 1, #list do
+      local want = list[i % #list + 1] -- classic ... reticle, then none
+      T.click(design)
+      check(db.display == want and design.text == "Design: " .. NS.DISPLAY_NAMES[want], "left click: " .. want .. " (" .. tostring(db.display) .. ")")
+      check(textOn(page, NS.DISPLAY_NOTES[want]) ~= nil, want .. ": its note")
+      local errs, drawn, late = #T.errors, 0, false
+      for k = 1, 37 do
+        T.now = T.now + 0.25 T.update()
+        if T.shownParts(r) > 0 then drawn = drawn + 1 end
+        if lateFS:IsShown() and lateFS.text == "+0.60" then late = true end
+      end
+      local d = want == "none" and "classic" or want
+      local w, h = NS.DisplaySize(db, d)
+      if want == "none" then w, h = 200, 14 end
+      check(#T.errors == errs, want .. ": the preview runs without errors (" .. (#T.errors - errs) .. ")")
+      check(r.design == d and r.w == w and r.h == h, want .. ": the preview draws " .. d .. " at " .. w .. "x" .. h .. " (" .. tostring(r.design) .. " " .. tostring(r.w) .. "x" .. tostring(r.h) .. ")")
+      local fit = math.min(1, 250 / w, 100 / h)
+      check(close(r.frame:GetScale(), fit, 0.002), want .. ": scaled to fit the box (" .. num(r.frame:GetScale()) .. ", want " .. num(fit) .. ")")
+      check(drawn == 37, want .. ": drawn on every frame (" .. drawn .. ")")
+      check(late, want .. ": the made-up late shot's delay shows")
+      if want ~= "none" then
+        check(ShotWindowDisplay and ShotWindowDisplay:IsShown() and T.rend().design == want, want .. ": the display itself follows")
+      end
+    end
+    check(db.display == "none" and not ShotWindowDisplay:IsShown(), "round to none: the display hidden")
+    T.click(design, "RightButton")
+    check(db.display == "reticle" and design.text == "Design: Tightening reticle", "right click from none: the last design")
+    T.click(design, "RightButton")
+    check(db.display == "ring", "right click again: the one before")
+    T.update()
+    check(#T.errors == 0, "no errors")
+  `);
+}
+
+scenario('options: the Display page grays out what the chosen design does not use; its sliders and the scanner button change the settings', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  T.slash("")
+  T.click(T.tab(2))
+  local db = ShotWindowDB
+  local function u(on) return on and "usable" or "grayed" end
+  for _, d in ipairs(NS.DISPLAYS) do
+    T.slash("display " .. d)
+    local straight = d ~= "none" and not NS.ROUND_DISPLAYS[d]
+    local round = NS.ROUND_DISPLAYS[d] == true
+    checkControls(d, {
+      ["Length"] = u(straight), ["Thickness of a bar"] = u(straight),
+      ["Size of a round design"] = u(round), ["Line thickness of a round design"] = u(round),
+      ["Rhythm track: seconds shown"] = u(d == "track"), ["Pips: how many"] = u(d == "pips"),
+      ["Lock in place"] = u(d ~= "none"), ["Sit on the game's swing bar"] = u(d ~= "none"), ["Show out of combat too"] = u(d ~= "none"),
+      ["Move color"] = "usable", ["Use the window style's accent for move"] = "usable",
+    })
+    check(grayOf("Scanner: out and back") == u(d == "scanner"), d .. ": the Scanner button " .. u(d == "scanner") .. " (" .. grayOf("Scanner: out and back") .. ")")
+    check(grayOf("Reset position") == u(d ~= "none"), d .. ": Reset position " .. u(d ~= "none") .. " (" .. grayOf("Reset position") .. ")")
+  end
+  T.slash("display classic")
+  T.drag(T.slider("Length"), 300)
+  check(db.dispWidth == 300 and T.sliderText("Length") == "300 px" and T.rend().w == 300 and ShotWindowDisplay.width == 300, "Length 300: the bar 300 long")
+  T.drag(T.slider("Thickness of a bar"), 24)
+  check(db.dispHeight == 24 and T.rend().h == 24, "Thickness of a bar 24")
+  T.slash("display vpincer")
+  check(T.rend().w == 24 and T.rend().h == 300, "the vertical pincer stands that bar on end")
+  T.slash("display ring")
+  T.drag(T.slider("Size of a round design"), 200)
+  check(db.dispSize == 200 and T.rend().w == 200 and T.rend().h == 200, "round size 200")
+  T.drag(T.slider("Line thickness of a round design"), 16)
+  check(db.dispThick == 16, "line thickness 16")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  -- Blizzard style: the ring's fill is the bar's fill art (QAfill: a seamless strip, its thickness
+  -- the distance from its inner corners to its outer ones).
+  local rr = T.rend()
+  local ringFill = T.part(rr, "QAfill1")
+  local cs = T.quadCorners(ringFill)
+  local fillThick = type(cs) == "table" and (dist(cs[1][1], cs[1][2], rr.w / 2, rr.h / 2) - dist(cs[2][1], cs[2][2], rr.w / 2, rr.h / 2)) or nil
+  check(rr.mode == "art" and rr.quads == true and close(fillThick, 16, 1e-6),
+    "the ring's fill drawn 16 thick in the bar's art (" .. tostring(rr.mode) .. ", " .. num(fillThick) .. ")")
+  T.slash("display arc")
+  check(T.rend().w == 200 and close(T.rend().h, 160), "the arc 200 wide, 0.8 as tall")
+  T.slash("display track")
+  T.drag(T.slider("Rhythm track: seconds shown"), 8)
+  check(db.trackSeconds == 8 and T.sliderText("Rhythm track: seconds shown") == "8 s", "the rhythm track shows 8 s")
+  T.slash("display scanner")
+  T.click(T.button("Scanner: out and back"))
+  check(db.scanMode == "wrap" and T.button("Scanner: left to right") ~= nil, "the scanner button: left to right")
+  T.click(T.button("Scanner: left to right"), "RightButton")
+  check(db.scanMode == "pingpong", "and back")
+  T.slash("display pips")
+  T.drag(T.slider("Pips: how many"), 15)
+  check(db.pipCount == 15 and T.sliderText("Pips: how many") == "15", "Pips 15: 15 saved and shown (" .. tostring(db.pipCount) .. ", label " .. tostring(T.sliderText("Pips: how many")) .. ")")
+  T.now = 102 T.update()
+  local r, n = T.rend(), 0
+  for i = 1, 30 do if T.isShown(T.part(r, "p" .. i)) then n = n + 1 end end
+  check(n == T.slider("Pips: how many"):GetValue(), "as many pips drawn as the slider is set to (" .. n .. " drawn, slider at " .. tostring(T.slider("Pips: how many"):GetValue()) .. ", label " .. tostring(T.sliderText("Pips: how many")) .. ")")
+  T.drag(T.slider("Pips: how many"), 5)
+  check(db.pipCount == 5 and T.sliderText("Pips: how many") == "5", "the slider's low end: 5 pips (" .. tostring(db.pipCount) .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('options: the Alerts page controls change the settings and gray out with their checkboxes', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  T.slash("")
+  T.click(T.tab(3))
+  local db = ShotWindowDB
+  checkControls("defaults", { ["Warn when I move inside the zone"] = "usable", ["Clip color"] = "usable", ["Show how late a late shot was"] = "usable",
+    ["Say Stop, Moving, Late and Go"] = "usable", ["Text size"] = "grayed", ["Play a sound as the zone starts"] = "usable",
+    ["Tint the screen's edges to stand still"] = "usable", ["Edge width"] = "grayed" })
+  check(grayOf("Sound: Tick") == "grayed", "the sound choice grayed while sound is off")
+  T.click(T.checkbox("Warn when I move inside the zone"))
+  check(db.warnMove == false and T.checkbox("Warn when I move inside the zone"):GetChecked() == false, "warnMove off")
+  checkControls("warnMove off", { ["Clip color"] = "usable" })
+  T.click(T.checkbox("Show how late a late shot was"))
+  check(db.lateText == false, "lateText off")
+  checkControls("both off", { ["Clip color"] = "grayed" })
+  T.click(T.checkbox("Warn when I move inside the zone")) T.click(T.checkbox("Show how late a late shot was"))
+  check(db.warnMove and db.lateText, "both on again")
+  T.click(T.checkbox("Say Stop, Moving, Late and Go"))
+  check(db.callout == true and rawget(_G, "ShotWindowCallout") ~= nil, "call-out on: its frame made")
+  checkControls("call-out on", { ["Text size"] = "usable" })
+  T.drag(T.slider("Text size"), 40)
+  local fs = ShotWindowCallout.fontStrings[1]
+  check(db.calloutSize == 40 and T.sliderText("Text size") == "40 pt" and fs.fontSize == 40, "Text size 40: the call-out in 40 pt (" .. tostring(fs.fontSize) .. ")")
+  T.click(T.checkbox("Play a sound as the zone starts"))
+  check(db.sound == true and grayOf("Sound: Tick") == "usable", "sound on: the choice usable")
+  local n = #T.sounds
+  T.click(T.button("Sound: Tick"))
+  check(db.soundKit == 2 and T.button("Sound: Ping") ~= nil and #T.sounds == n + 1 and T.sounds[#T.sounds].id == SOUNDKIT.MAP_PING, "left click: Ping, played to hear it")
+  T.click(T.button("Sound: Ping"), "RightButton")
+  check(db.soundKit == 1 and T.sounds[#T.sounds].id == SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON, "right click: back to Tick")
+  T.click(T.button("Sound: Tick"), "RightButton")
+  check(db.soundKit == 4 and T.button("Sound: Raid warning") ~= nil and T.sounds[#T.sounds].id == SOUNDKIT.RAID_WARNING, "right click from the first: the last")
+  T.click(T.checkbox("Tint the screen's edges to stand still"))
+  check(db.edge == true and rawget(_G, "ShotWindowEdge") ~= nil, "edge on: its frame made")
+  checkControls("edge on", { ["Edge width"] = "usable" })
+  T.drag(T.slider("Edge width"), 150)
+  check(db.edgeSize == 150 and T.sliderText("Edge width") == "150 px", "Edge width 150")
+  T.click(T.swatch("Clip color")) T.pickColor(0.2, 0.4, 1) T.pickerOkay()
+  check(sameRGB(db.clipColor, { 0.2, 0.4, 1 }), "Clip color picked")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.5 T.fire("PLAYER_STARTED_MOVING") T.update()
+  local edge, top = ShotWindowEdge, ShotWindowEdge.textures[1]
+  local g = rawget(top, "gradient")
+  check(edge:IsShown() and close(top.height, 150) and g and sameRGB({ g[3].r, g[3].g, g[3].b }, db.clipColor), "in a fight: the edge 150 px in the picked clip color")
+  check(ShotWindowCallout:IsShown() and fs.text == "Moving" and sameRGB(fs.textColor, db.clipColor), "Moving in the picked clip color")
+  check(#T.sounds == n + 4 and T.sounds[#T.sounds].id == SOUNDKIT.RAID_WARNING, "the zone's sound in the chosen kit (" .. (#T.sounds - n) .. " since)")
+  local box = T.preview(T.pages()[3])
+  check(box and box:IsVisible() and box.renderer ~= T.preview(T.pages()[2]).renderer, "a preview of its own on the Alerts page")
+  local errs = #T.errors
+  for k = 1, 37 do T.now = T.now + 0.25 T.update() end
+  check(#T.errors == errs and T.shownParts(box.renderer) > 0, "it runs")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('options: Defaults puts every display and alert setting back and hides what they made', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  T.slash("")
+  local db = ShotWindowDB
+  local changed = { display = "ring", warnMove = false, lateText = false, callout = true, calloutSize = 40, edge = true, edgeSize = 150,
+    sound = true, soundKit = 3, moveAccent = false, dispWidth = 300, dispHeight = 20, dispSize = 200, dispThick = 20,
+    artFlip = true, dispLocked = false, dispAlways = true, dispOnBar = false, scanMode = "wrap", trackSeconds = 8, pipCount = 15 }
+  for k, v in pairs(changed) do db[k] = v end
+  db.clipColor[1], db.moveColor[2] = 0, 0
+  T.slash("display ring")
+  check(ShotWindowDisplay:IsShown() and rawget(_G, "ShotWindowCallout") ~= nil and rawget(_G, "ShotWindowEdge") ~= nil, "a display, a call-out and an edge before the reset")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 102.5 T.update()
+  check(ShotWindowCallout:IsShown() and ShotWindowEdge:IsShown(), "both showing inside the zone")
+  T.click(T.button("Defaults"))
+  local want = { display = "none", warnMove = true, lateText = true, callout = false, calloutSize = 26, edge = false, edgeSize = 90,
+    sound = false, soundKit = 1, moveAccent = true, dispWidth = 240, dispHeight = 16, dispSize = 140, dispThick = 12,
+    artFlip = false, dispLocked = true, dispAlways = false, dispOnBar = false, scanMode = "pingpong", trackSeconds = 5, pipCount = 11 }
+  local bad = {}
+  for k, v in pairs(want) do if db[k] ~= v then bad[#bad + 1] = k .. "=" .. tostring(db[k]) end end
+  table.sort(bad)
+  check(#bad == 0, "every new key back to its default (" .. table.concat(bad, ", ") .. ")")
+  check(sameRGB(db.clipColor, { 1, 0.6, 0.1 }) and sameRGB(db.moveColor, { 0.39, 0.6, 0.13 }), "clip and move colors back")
+  check(not ShotWindowDisplay:IsShown(), "display none: hidden")
+  T.update()
+  check(not ShotWindowCallout:IsShown() and not ShotWindowEdge:IsShown(), "call-out and edge gone")
+  T.click(T.tab(2))
+  check(buttonStarting("Design: ").text == "Design: None (marks on the game's bar only)", "the Design button says None")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('themes: Blizzard puts the swing timer art round a bar design; Dark a flat panel and outline in its colors; texts in the style font', DISPLAY_HELPERS + String.raw`
+  GameFontNormal = { GetFont = function() return "Fonts\\STYLE.TTF", 12, "" end } -- read by Dark's GetFont
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "classic" }
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.Styles.Applied() == nil, "Blizzard")
+  local r = T.rend()
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  local c = r.chrome
+  check(rawget(c.bg, "atlas") == "ui-swingtimerbar-background" and rawget(c.art, "atlas") == "ui-swingtimerbar-frame" and T.isShown(c.bg) and T.isShown(c.art), "Blizzard: the swing timer's background and frame atlases")
+  local p = c.art.points
+  check(#p == 2 and p[1][1] == "TOPLEFT" and p[1][4] == -5 and p[1][5] == 4 and p[2][1] == "BOTTOMRIGHT" and p[2][4] == 5 and p[2][5] == -4, "the art 5 px out at the ends and 4 at top and bottom, as round the game's bar")
+  check(sameRGB(rgbOf(T.part(r, "track")), { 0.05, 0.05, 0.06 }) and close(alphaOf(T.part(r, "track")), 0.6), "the track in Blizzard's dark")
+  T.slash("display ring") T.now = 101.1 T.update()
+  local count = T.part(T.rend(), "count")
+  check(count.fontFile == "Fonts\\FRIZQT__.TTF" and count.fontFlags == "OUTLINE", "Blizzard: the ring's countdown in the game's font (" .. tostring(count.fontFile) .. ")")
+  local calls = count.fontCalls
+  for k = 1, 10 do T.now = 101.1 + k * 0.05 T.update() end
+  check(count.fontCalls == calls, "the font is set once, not every frame (" .. (count.fontCalls - calls) .. " more)")
+  T.slash("style dark")
+  check(NS.Styles.Applied() == "dark", "Dark drawn at once")
+  T.now = 101.8 T.update()
+  -- Draw.ring, drawn flat: radius min(w, h) / 2 - thickness * 1.7 (the thickness capped to
+  -- 0.8 * half / (1 + 0.8 * 1.7)), countdown at 0.45 of it (10 at least).
+  local db = ShotWindowDB
+  local ringW, ringH = NS.DisplaySize(db, "ring")
+  local ringHalf = math.min(ringW, ringH) / 2
+  local ringTh = math.max(1, math.min(db.dispThick, 0.8 * ringHalf / (1 + 0.8 * 1.7)))
+  local size = math.max(10, math.floor((ringHalf - ringTh * 1.7) * 0.45))
+  check(count.fontFile == "Fonts\\STYLE.TTF" and count.fontSize == size, "Dark: the countdown in the style's font (" .. tostring(count.fontFile) .. " " .. tostring(count.fontSize) .. ")")
+  T.slash("display arc") T.now = 101.9 T.update()
+  local label = T.part(T.rend(), "label")
+  check(label.fontFile == "Fonts\\STYLE.TTF", "Dark: the arc's label in the style's font (" .. tostring(label.fontFile) .. ")")
+  T.slash("display pincer") T.now = 102.0 T.update()
+  r = T.rend()
+  c = r.chrome
+  local black = 0
+  for i = 1, 4 do if T.isShown(c.edges[i]) and sameRGB(rgbOf(c.edges[i]), { 0, 0, 0 }) and close(alphaOf(c.edges[i]), 1) then black = black + 1 end end
+  check(T.isShown(c.bg) and rawget(c.bg, "atlas") == nil and sameRGB(rgbOf(c.bg), { 0.07, 0.07, 0.08 }) and close(alphaOf(c.bg), 0.9) and not T.isShown(c.art), "Dark: a flat panel in its color, no atlas")
+  check(black == 4, "Dark: a black outline (" .. black .. " edges)")
+  local e1 = c.edges[1]
+  check(e1.height == 1 and e1.points[1][1] == "TOPLEFT" and e1.points[1][3] == -4 and e1.points[1][4] == 4, "one pixel, just outside the panel")
+  check(sameRGB(rgbOf(T.part(r, "track")), { 0.07, 0.07, 0.08 }) and close(alphaOf(T.part(r, "track")), 0.85), "Dark: the track in its panel color")
+  check(sameRGB(rgbOf(T.part(r, "left")), { NS.Styles.S.GetAccentColor() }), "Dark: the move color is its accent")
+  ShotWindowDB.moveAccent = false
+  T.now = 102.05 T.update()
+  check(sameRGB(rgbOf(T.part(r, "left")), ShotWindowDB.moveColor), "accent for move off: the move color itself")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('themes: EllesmereUI chosen live: the displays take its track, accent and font at once; so does the call-out', DISPLAY_HELPERS + String.raw`
+  EUI_S.GetFont = function() return "Fonts\\EUI.TTF" end
+  ShotWindowDB = { style = "blizzard", display = "ring", callout = true }
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  EUI_FN(EUI_S)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(NS.Styles.Applied() == nil, "Blizzard chosen: nothing drawn")
+  local fs = ShotWindowCallout.fontStrings[1]
+  check(fs.fontFile == "Fonts\\FRIZQT__.TTF", "the call-out in the game's font under Blizzard")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  local count = T.part(T.rend(), "count")
+  check(count.fontFile == "Fonts\\FRIZQT__.TTF", "the countdown in the game's font")
+  T.slash("style auto")
+  check(NS.Styles.Applied() == "eui", "Automatic: EllesmereUI's look at once")
+  T.now = 101.1 T.update()
+  check(count.fontFile == "Fonts\\EUI.TTF", "the countdown in its font at once (" .. tostring(count.fontFile) .. ")")
+  -- Drawn flat in seamless strips: the fill is Qf, the track Qtt (Line strips: f and t).
+  local fk, tk = T.rend().quads and "Qf1" or "f1", T.rend().quads and "Qtt1" or "t1"
+  check(sameRGB(rgbOf(T.part(T.rend(), fk)), { 0.1, 0.6, 0.3 }), "the move color is its accent (" .. rgbStr(rgbOf(T.part(T.rend(), fk))) .. ")")
+  check(sameRGB(rgbOf(T.part(T.rend(), tk)), { 0.05, 0.05, 0.06 }) and close(alphaOf(T.part(T.rend(), tk)), 0.85), "the ring's track in its panel color")
+  T.now = 102.4 T.update()
+  check(ShotWindowCallout:IsShown() and fs.text == "Stop", "the call-out speaks inside the zone")
+  check(fs.fontFile == "Fonts\\EUI.TTF", "the call-out takes the style's font too (" .. tostring(fs.fontFile) .. ")")
+  check(#T.errors == 0, "no errors")
+`, EUI_PRE);
+
+scenario('displays: secret weapon speed and latency (the trap covers Displays.lua): nothing drawn until a swing is known, then every design draws', DISPLAY_HELPERS + String.raw`
+  T.speed = { mh = secret(2.0), oh = nil, rng = secret(2.8) }
+  T.net = { 0, 0, secret(40), secret(120) }
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "track", callout = true, edge = true, sound = true }
+  T.login(200)
+  T.update()
+  local r = T.rend()
+  check(T.shownParts(r) == 0 and r.chrome == nil, "no swing known: nothing drawn, no frame round it")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  for _, d in ipairs(NS.DISPLAYS) do
+    T.slash("display " .. d)
+    T.update()
+    if d ~= "none" then check(T.shownParts(T.rend()) > 0, d .. ": drawn from the swing") end
+  end
+  T.now = 102.81 T.update() T.now = 103.2 T.update()
+  T.now = 103.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+  T.slash("")
+  T.click(T.tab(2))
+  for k = 1, 12 do T.now = 103.4 + k * 0.3 T.update() end
+  check(#T.errors == 0, "no errors, no refused secret uses")
+`);
+
+scenario('displays: the first shot\'s wind-up is not a late shot: the ring and the arc say so the way the call-out does', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", false
+  ShotWindowDB = { display = "ring", callout = true }
+  T.login(200)
+  T.now = 100 T.fire("START_AUTOREPEAT_SPELL")
+  T.now = 100.5 T.update()
+  check(T.stateHas("waiting") and ShotWindowCallout.fontStrings[1].text == "Stop", "the call-out: Stop, not Late, for the first shot's wait")
+  local count = T.part(T.rend(), "count")
+  check(count and count.text ~= "Late", "the ring's countdown does not call the first shot late (" .. tostring(count and count.text) .. ")")
+  T.slash("display arc") T.now = 100.6 T.update()
+  local label = T.part(T.rend(), "label")
+  check(label and label.text ~= "Late", "nor does the arc's label (" .. tostring(label and label.text) .. ")")
+  T.now = 100.7 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 103.51 T.update() T.now = 103.8 T.update()
+  check(label.text == "Late" and ShotWindowCallout.fontStrings[1].text == "Late", "a shot that is late: Late on both")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('displays: a saved design this version does not know counts as none; the options still work', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "hexagon" }
+  T.login(200)
+  T.update()
+  check(rawget(_G, "ShotWindowDisplay") == nil, "no display made for an unknown design")
+  T.slash("")
+  T.click(T.tab(2))
+  for k = 1, 10 do T.now = 100 + k * 0.3 T.update() end
+  T.click(buttonStarting("Design: "))
+  check(NS.DISPLAY_NAMES[ShotWindowDB.display] ~= nil, "the Design button steps to a design it knows (" .. tostring(ShotWindowDB.display) .. ")")
+  T.update()
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('displays: the scanner sweeping left to right also stops on the shot line while holding', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "scanner", scanMode = "wrap" }
+  T.login(200)
+  local r = T.rend()
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 100.01 T.update()
+  local x0 = mid(T.rect(T.part(r, "spark")))
+  check(close(x0, r.w / 2, 1), "it leaves from the shot line (x " .. num(x0) .. ")")
+  T.now = 101.4 T.update()
+  local x1 = mid(T.rect(T.part(r, "spark")))
+  check(close(x1, 0, 1) or close(x1, r.w, 1), "halfway through the swing: at an end, wrapping round (x " .. num(x1) .. ")")
+  T.now = 102.81 T.update() T.now = 103.1 T.update()
+  check(close(mid(T.rect(T.part(r, "spark"))), r.w / 2), "holding: on the shot line")
+  check(not T.isShown(T.part(r, "zoneR")) and T.isShown(T.part(r, "zoneL")), "the zone only on the side it comes back from")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('displays: no ranged weapon hides the drawing and the frame round it; a bow brings both back', DISPLAY_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "classic" }
+  T.login(200)
+  T.update()
+  local r = T.rend()
+  check(T.shownParts(r) > 0 and T.isShown(r.chrome.bg) and T.isShown(r.chrome.art), "a bow: drawn at its speed, with the bar art")
+  T.speed.rng = nil
+  T.fire("PLAYER_EQUIPMENT_CHANGED", 18, true) T.update()
+  check(T.shownParts(r) == 0 and not T.isShown(r.chrome.bg) and not T.isShown(r.chrome.art), "no ranged weapon: nothing drawn, no art left behind")
+  T.speed.rng = 3.0
+  T.fire("PLAYER_EQUIPMENT_CHANGED", 18, false) T.update()
+  check(T.shownParts(r) > 0 and T.isShown(r.chrome.bg) and T.isShown(r.chrome.art), "a bow again: drawn with its art")
+  check(#T.errors == 0, "no errors")
+`);
+
+// ---------------------------------------------------------------------------------------------
+// Blizzard art on the round designs: under the Blizzard style the arc, the ring and the reticle wear
+// the swing timer bar's art (background, fill, frame) bent round the curve, one atlas slice per Line.
+
+// Where the arc and the ring lie, worked out from their size and line thickness alone (shared by
+// the Line strip and the seamless strip helpers).
+const ROUND_GEOM = String.raw`
+  -- The line thickness is capped so a thick line on a small design stays a ring: a band kw * th
+  -- wide on radius avail - kr * th is at most 0.8 of that radius wide (1 at the least).
+  local function fitThick(th, avail, kw, kr) return math.max(1, math.min(th, 0.8 * avail / (kw + 0.8 * kr))) end
+  -- The arc or the ring, mode "art" (the bar's art) or "flat": center cx, cy; the line thickness th
+  -- (capped); for art the frame and background widths fw, bw; the radius rad; widest, the widest
+  -- band drawn; and mark0, mark1, the radii the shot mark runs between (straight up from the center).
+  local function roundGeom(D, mode, W, H, dispThick)
+    local K, BK = 30 / 22, 26 / 22
+    local g = { cx = W / 2 }
+    if D == "arc" then
+      g.cy = H * NS.ARC_CY
+      if mode == "art" then
+        local avail = math.min(W / 2, H * 0.55) - 1
+        g.th = fitThick(dispThick, avail, K, K / 2)
+        g.fw, g.bw = g.th * K, g.th * BK
+        g.rad = avail - g.fw / 2
+      else
+        local avail = math.min(W / 2, H * 0.55)
+        g.th = fitThick(dispThick, avail, 1, 1)
+        g.rad = avail - g.th
+      end
+    else
+      g.cy = H / 2
+      local half = math.min(W, H) / 2
+      if mode == "art" then
+        g.th = fitThick(dispThick, half, K, K / 2 + 0.8)
+        g.fw, g.bw = g.th * K, g.th * BK
+        g.rad = half - g.fw / 2 - g.th * 0.8
+      else
+        g.th = fitThick(dispThick, half, 1, 1.7)
+        g.rad = half - 1.7 * g.th
+      end
+    end
+    g.widest = g.fw or g.th
+    local mt = mode == "art" and (g.fw / 2 + 2) or g.th
+    g.mark0, g.mark1 = math.max(g.rad - mt, g.rad * 0.3, 1), g.rad + mt * 1.6
+    return g
+  end
+`;
+
+// Lua helpers for the art scenarios (they follow DISPLAY_HELPERS).
+const ART_HELPERS = ROUND_GEOM + String.raw`
+  local ART_FRAME_K, ART_OVERLAP = 30 / 22, 0.12
+  local SLICE = { bg = "ui-swingtimerbar-background", fill = "ui-swingtimerbar-filling-ranged", frame = "ui-swingtimerbar-frame" }
+  -- The strips that never change shape in a fight, and the fill strips that do (key, segments).
+  local STATIC = { arc = { { "Abg", 44 }, { "Aframe", 44 } }, ring = { { "Abg", 40 }, { "Aframe", 40 } }, reticle = { { "Arim", 40 } } }
+  local FILLS = { arc = { { "Afl", 22 }, { "Afr", 22 } }, ring = { { "Afill", 40 } }, reticle = { { "Acirc", 32 } } }
+
+  -- Where a round design's strips lie, worked out from its size alone: for each strip the center,
+  -- the radius, the two ends of its path (angles counterclockwise from the right, y up), how many
+  -- segments, the thickness, the sublevel. p is the swing's progress (the reticle's circle shrinks).
+  local function artGeom(D, W, H, th, p)
+    local top, g = math.pi / 2, {}
+    local function S(key, cx, cy, rad, a0, a1, n, thick, sub)
+      g[key] = { cx = cx, cy = cy, rad = rad, a0 = a0, a1 = a1, n = n, thick = thick, sub = sub }
+    end
+    if D == "ring" then -- clockwise from the top, all the way round
+      local rg = roundGeom(D, "art", W, H, th) -- the line thickness capped to the size
+      th = rg.th
+      local fw, bw = rg.fw, rg.bw
+      local cx, cy, rad = rg.cx, rg.cy, rg.rad
+      local fin = top - 2 * math.pi
+      S("Abg", cx, cy, rad, top, fin, 40, bw, 0)
+      S("Azone", cx, cy, rad, top, fin, 40, bw, 1)
+      S("Afill", cx, cy, rad, top, fin, 40, th, 2)
+      S("Atint", cx, cy, rad, top, fin, 40, th, 3)
+      S("Aframe", cx, cy, rad, top, fin, 40, fw, 4)
+    elseif D == "arc" then -- the horseshoe from its left end to its right end; each fill climbs a side to the top
+      local rg = roundGeom(D, "art", W, H, th)
+      th = rg.th
+      local fw, bw = rg.fw, rg.bw
+      local cx, cy, rad = rg.cx, rg.cy, rg.rad
+      local left, right = top + math.rad(110), top - math.rad(110)
+      S("Abg", cx, cy, rad, left, right, 44, bw, 0)
+      S("Azone", cx, cy, rad, left, right, 44, bw, 1)
+      S("Afl", cx, cy, rad, left, top, 22, th, 2)
+      S("Afr", cx, cy, rad, right, top, 22, th, 2)
+      S("Atl", cx, cy, rad, left, top, 22, th, 3)
+      S("Atr", cx, cy, rad, right, top, 22, th, 3)
+      S("Aframe", cx, cy, rad, left, right, 44, fw, 4)
+    else -- the reticle: a rim of frame art, inside it the tightening circle in fill art
+      local t = math.max(2, th / 2)
+      local half = math.min(W, H) / 2
+      -- The rim as wide as fits after the circle's own travel (12 of it at least).
+      local rim = math.max(0, math.min(t * ART_FRAME_K * 1.4, half - t - 2 - 12))
+      local cx, cy = W / 2, H / 2
+      local rmax = half - t - 2 - rim
+      local rmin = math.max(4, rmax * 0.12)
+      local rad = rmin + (rmax - rmin) * (1 - (p or 0))
+      -- The circle never thicker than 0.8 of its radius, so it stays a ring as it closes.
+      local function thickOf(radius) return math.min(t * 1.4, radius * 0.8) end
+      S("Arim", cx, cy, half - rim / 2 - 1, top, top - 2 * math.pi, 40, rim, 0)
+      S("Acirc", cx, cy, rad, top, top - 2 * math.pi, 32, thickOf(rad), 2)
+      S("Atint", cx, cy, rad, top, top - 2 * math.pi, 32, thickOf(rad), 3)
+      g.Acirc.thickOf, g.Atint.thickOf = thickOf, thickOf
+      g.rmin, g.rmax, g.rim = rmin, rmax, rim
+    end
+    return g
+  end
+
+  -- The shown segments of a strip, sorted along the path: each end's angle about the center (unwound
+  -- next to where segment i belongs) and its fraction of the path, its distance from the center, and
+  -- the turn from start to end (negative: clockwise).
+  local function readStrip(r, key, g)
+    local segs, bad = {}, {}
+    for i = 1, g.n do
+      local line = T.part(r, key .. i)
+      if T.isShown(line) then
+        local x1, y1, x2, y2 = T.segEnds(line)
+        if type(x1) ~= "number" or rawget(line, "kind") ~= "Line" then
+          bad[#bad + 1] = key .. i .. " (" .. tostring(x1) .. ")"
+        else
+          local aim = g.a0 + (g.a1 - g.a0) * (i - 0.5) / g.n
+          local function at(x, y)
+            local a = math.atan(y - g.cy, x - g.cx)
+            while a - aim > math.pi do a = a - 2 * math.pi end
+            while aim - a > math.pi do a = a + 2 * math.pi end
+            return a, (a - g.a0) / (g.a1 - g.a0)
+          end
+          local A1, f1 = at(x1, y1)
+          local A2, f2 = at(x2, y2)
+          segs[#segs + 1] = { i = i, line = line, A1 = A1, A2 = A2, f1 = f1, f2 = f2,
+            lo = math.min(f1, f2), hi = math.max(f1, f2),
+            d1 = dist(x1, y1, g.cx, g.cy), d2 = dist(x2, y2, g.cx, g.cy),
+            turn = (x1 - g.cx) * (y2 - g.cy) - (y1 - g.cy) * (x2 - g.cx) }
+        end
+      end
+    end
+    table.sort(segs, function(a, b) return a.lo < b.lo end)
+    return segs, bad
+  end
+  local function stripSpan(segs)
+    local lo, hi
+    for _, s in ipairs(segs) do
+      lo = lo and math.min(lo, s.lo) or s.lo
+      hi = hi and math.max(hi, s.hi) or s.hi
+    end
+    return lo, hi
+  end
+
+  -- Every check on one strip. want: slice ("bg", "fill" or "frame") for art, or color for a flat
+  -- strip; alpha (nil: any); flip (top and bottom swapped); anyRadius (one circle, of any radius).
+  -- to = nil skips the count of segments shown. Returns the segments and the span they cover.
+  local function checkStrip(tag, r, key, g, from, to, want)
+    local segs, bad = readStrip(r, key, g)
+    local label = tag .. key .. ": "
+    check(#bad == 0, label .. "every shown segment a Line between two points (not: " .. table.concat(bad, ", ") .. ")")
+    if want.anyRadius and segs[1] then
+      local copy = {}
+      for k, v in pairs(g) do copy[k] = v end
+      copy.rad = segs[1].d1
+      if g.thickOf then copy.thick = g.thickOf(copy.rad) end -- a thickness that follows the radius
+      g = copy
+    end
+    if to then
+      local expect = 0
+      if want.alpha == nil or want.alpha > 0 then
+        for i = 1, g.n do if math.min(i / g.n, to) > math.max((i - 1) / g.n, from) then expect = expect + 1 end end
+      end
+      check(#segs == expect, label .. expect .. " segments shown (" .. #segs .. ")")
+    end
+    local off, ccw, thick, sub, file, args, tex, vert, col = {}, {}, {}, {}, {}, {}, {}, {}, {}
+    local l, rr, t, b
+    if want.slice then l, rr, t, b = T.atlasCoords(SLICE[want.slice]) end
+    for _, s in ipairs(segs) do
+      local line = s.line
+      if not (close(s.d1, g.rad, 1e-6) and close(s.d2, g.rad, 1e-6)) then off[#off + 1] = s.i .. " at " .. num(s.d1) .. "/" .. num(s.d2) end
+      if want.slice and not (s.turn < 0 and s.A1 > s.A2) then ccw[#ccw + 1] = s.i end -- art only: flat color has no top edge
+      if not close(rawget(line, "thickness"), g.thick, 1e-6) then thick[#thick + 1] = s.i .. "=" .. num(rawget(line, "thickness")) end
+      if rawget(line, "sublevel") ~= g.sub then sub[#sub + 1] = s.i .. "=" .. tostring(rawget(line, "sublevel")) end
+      if want.slice then
+        if rawget(line, "file") ~= T.atlasFile then file[#file + 1] = s.i .. "=" .. tostring(rawget(line, "file")) end
+        local tc = rawget(line, "texCoord")
+        if rawget(line, "texCoordArgs") ~= 4 or type(tc) ~= "table" then
+          args[#args + 1] = s.i .. "=" .. tostring(rawget(line, "texCoordArgs"))
+        else
+          local top, bottom = t, b
+          if want.flip then top, bottom = b, t end
+          local u1, u2 = (tc[1] - l) / (rr - l), (tc[2] - l) / (rr - l)
+          local inside = u1 >= -1e-9 and u1 <= 1 + 1e-9 and u2 >= -1e-9 and u2 <= 1 + 1e-9
+          if not (inside and close(tc[3], top, 1e-12) and close(tc[4], bottom, 1e-12) and close(u1, s.f1, 1e-6) and close(u2, s.f2, 1e-6)) then
+            tex[#tex + 1] = s.i .. " (u " .. num(u1) .. " to " .. num(u2) .. " lying at " .. num(s.f1) .. " to " .. num(s.f2)
+              .. ", v " .. num(tc[3]) .. " to " .. num(tc[4]) .. ")"
+          end
+        end
+        local v = rawget(line, "vertex")
+        if not (v and close(v[1], 1, 1e-9) and close(v[2], 1, 1e-9) and close(v[3], 1, 1e-9) and (want.alpha == nil or close(v[4], want.alpha, 1e-6))) then
+          vert[#vert + 1] = s.i .. "=" .. rgbStr(v) .. "/" .. num(v and v[4])
+        end
+      else
+        local c = rawget(line, "colorTex")
+        if not (c and sameRGB(c, want.color) and (want.alpha == nil or close(c[4], want.alpha, 1e-6))) then
+          col[#col + 1] = s.i .. "=" .. rgbStr(c) .. "/" .. num(c and c[4])
+        end
+      end
+    end
+    check(#off == 0, label .. "every end on the circle of radius " .. num(g.rad) .. " (not: " .. table.concat(off, ", ") .. ")")
+    if want.slice then
+      check(#ccw == 0, label .. "every art segment drawn clockwise, from the larger angle to the smaller (not: " .. table.concat(ccw, ", ") .. ")")
+    end
+    check(#thick == 0, label .. "thickness " .. num(g.thick) .. " (not: " .. table.concat(thick, ", ") .. ")")
+    check(#sub == 0, label .. "sublevel " .. g.sub .. " (not: " .. table.concat(sub, ", ") .. ")")
+    if want.slice then
+      check(#file == 0, label .. "the atlas file " .. T.atlasFile .. " on every segment (not: " .. table.concat(file, ", ") .. ")")
+      check(#args == 0, label .. "SetTexCoord(left, right, top, bottom) on every segment (not: " .. table.concat(args, ", ") .. ")")
+      check(#tex == 0, label .. "each segment shows the slice of " .. SLICE[want.slice] .. " for where it lies on the path"
+        .. (want.flip and ", top and bottom swapped" or "") .. " (not: " .. table.concat(tex, "; ") .. ")")
+      check(#vert == 0, label .. "vertex color white" .. (want.alpha and (" at alpha " .. num(want.alpha)) or "") .. " (not: " .. table.concat(vert, ", ") .. ")")
+    else
+      check(#col == 0, label .. "flat " .. rgbStr(want.color) .. (want.alpha and (" at alpha " .. num(want.alpha)) or "") .. " (not: " .. table.concat(col, ", ") .. ")")
+    end
+    -- Along the path: no gaps; neighbors overlap only by the art's little overlap (flat: not at all).
+    local gaps, over, seams = {}, {}, {}
+    local most = want.slice and (2 * ART_OVERLAP / g.n + 1e-9) or 1e-9
+    for k = 2, #segs do
+      local a, c = segs[k - 1], segs[k]
+      if c.lo > a.hi + 1e-9 then gaps[#gaps + 1] = a.i .. "|" .. c.i end
+      if a.hi - c.lo > most then over[#over + 1] = a.i .. "|" .. c.i .. " by " .. num(a.hi - c.lo) end
+      if want.slice and a.hi - c.lo <= 1e-9 then seams[#seams + 1] = a.i .. "|" .. c.i end
+    end
+    check(#gaps == 0, label .. "no gaps between neighbors (" .. table.concat(gaps, ", ") .. ")")
+    check(#over == 0, label .. "neighbors overlap by " .. num(most) .. " of the path at most (" .. table.concat(over, ", ") .. ")")
+    if want.slice then
+      check(#seams == 0, label .. "art neighbors overlap a little, so the outer edge shows no seams (end to end: " .. table.concat(seams, ", ") .. ")")
+    end
+    local lo, hi = stripSpan(segs)
+    return segs, lo, hi
+  end
+
+  -- SetStartPoint calls on a list of strips of design D (whatever design is showing now), and
+  -- whether every segment of them is shown.
+  local function starts(r, list, D)
+    local n = 0
+    for _, ks in ipairs(list) do
+      for i = 1, ks[2] do
+        local s = r.segs[D .. ":" .. ks[1] .. i]
+        n = n + (s and s.line and rawget(s.line, "startCalls") or 0)
+      end
+    end
+    return n
+  end
+  local function total(list) local n = 0 for _, ks in ipairs(list) do n = n + ks[2] end return n end
+  local function shownAll(r, list)
+    for _, ks in ipairs(list) do
+      for i = 1, ks[2] do if not T.isShown(T.part(r, ks[1] .. i)) then return false end end
+    end
+    return true
+  end
+  -- Art strips of a design shown, and Lines wearing a texture.
+  local function artShown(r, D)
+    local n = 0
+    for name, s in pairs(r.segs) do
+      if name:sub(1, #D + 2) == D .. ":A" and T.isShown(s.line or s.tex) then n = n + 1 end
+    end
+    return n
+  end
+  local function textured(r)
+    local n = 0
+    for _, l in ipairs(rawget(r.frame, "lines") or {}) do if rawget(l, "file") ~= nil then n = n + 1 end end
+    return n
+  end
+`;
+
+// The scenarios written for the Line strips run without SetVertexOffset, so that path stays covered.
+const LINE_STRIPS = 'T.noVertexOffset = true -- the Line strips\n';
+
+scenario('Blizzard art (Line strips): the arc, the ring and the reticle wear the swing timer bar art; every segment clockwise on its circle, its slice continuous along the strip', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  check(NS.Styles.Applied() == nil and db.dispThick == 12 and db.artFlip == false, "the Blizzard style, lines 12 thick, the art the right way up")
+  local zf = 0.5 / 2.8
+  for index, D in ipairs({ "arc", "ring", "reticle" }) do
+    local tag = "[" .. D .. "] "
+    local errs = #T.errors
+    T.slash("display " .. D)
+    local r = T.rend()
+    local base = 100 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    for _, t in ipairs({ 0.9, 1.7, 2.55 }) do
+      T.now = base + t T.update()
+      local p = (T.now - base) / 2.8
+      local lit = t > 2.3
+      local when = tag .. "p " .. num(p) .. (lit and " (in the zone)" or "") .. ": "
+      check(r.mode == "art", when .. "drawn in the bar's art (" .. tostring(r.mode) .. ")")
+      local g = artGeom(D, r.w, r.h, db.dispThick, p)
+      local fillA, tintA = lit and 1 or 0.95, lit and 0.55 or 0
+      local zoneA = (lit and db.activeAlpha or db.idleAlpha) * 0.85
+      if D == "reticle" then
+        local _, lo, hi = checkStrip(when, r, "Arim", g.Arim, 0, 1, { slice = "frame", alpha = 1 })
+        check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), when .. "the rim all the way round (" .. num(lo) .. " to " .. num(hi) .. ")")
+        _, lo, hi = checkStrip(when, r, "Acirc", g.Acirc, 0, 1, { slice = "fill", alpha = fillA })
+        check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), when .. "the circle all the way round at its radius for p (" .. num(lo) .. " to " .. num(hi) .. ")")
+        checkStrip(when, r, "Atint", g.Atint, 0, 1, { color = db.color, alpha = tintA })
+      else
+        for _, key in ipairs({ "Abg", "Aframe" }) do
+          local _, lo, hi = checkStrip(when, r, key, g[key], 0, 1, { slice = key == "Abg" and "bg" or "frame", alpha = 1 })
+          check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), when .. key .. ": full length (" .. num(lo) .. " to " .. num(hi) .. ")")
+        end
+        for _, key in ipairs(D == "arc" and { "Afl", "Afr" } or { "Afill" }) do
+          local _, lo = checkStrip(when, r, key, g[key], 0, p, { slice = "fill", alpha = fillA })
+          check(close(lo, 0, 1e-6), when .. key .. ": the fill starts where its path does (" .. num(lo) .. ")")
+        end
+        local z0, z1 = 1 - zf, 1
+        if D == "arc" then z0, z1 = 0.5 - 0.5 * zf, 0.5 + 0.5 * zf end
+        local _, lo, hi = checkStrip(when, r, "Azone", g.Azone, z0, z1, { color = db.color, alpha = zoneA })
+        check(close(lo, z0, 1e-6) and close(hi, z1, 1e-6), when .. "the zone covers " .. (D == "arc" and "the middle " or "the last ")
+          .. num(zf) .. " of the path (" .. num(lo) .. " to " .. num(hi) .. ", want " .. num(z0) .. " to " .. num(z1) .. ")")
+        for _, key in ipairs(D == "arc" and { "Atl", "Atr" } or { "Atint" }) do
+          local _, tlo, thi = checkStrip(when, r, key, g[key], 0, p, { color = db.color, alpha = tintA })
+          if lit then check(close(tlo, 0, 1e-6) and close(thi, p, 1e-6), when .. key .. ": the tint over 0 to p exactly (" .. num(tlo) .. " to " .. num(thi) .. ")") end
+        end
+      end
+    end
+    check(T.debugSays("display: " .. NS.DISPLAY_NAMES[D] .. ", locked, shown, lines, Blizzard art, line strips"), tag .. "debug says Blizzard art, line strips")
+    check(#T.errors == errs, tag .. "no Lua errors (" .. (#T.errors - errs) .. ")")
+  end
+  local asked = {}
+  for _, name in ipairs(T.atlasQueries) do asked[name] = (asked[name] or 0) + 1 end
+  check(#T.atlasQueries == 3 and asked[SLICE.frame] == 1 and asked[SLICE.bg] == 1 and asked[SLICE.fill] == 1,
+    "the three atlases looked up once for the session, not every frame (" .. #T.atlasQueries .. " queries)")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('Blizzard art (Line strips): the zone and the tint follow the clock: clip color while moving in the zone, the hold shows the fill full and pulses, nothing tinted after the shot', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  local zf = 0.5 / 2.8
+  for index, D in ipairs({ "arc", "ring", "reticle" }) do
+    local tag = "[" .. D .. "] "
+    T.slash("display " .. D)
+    local r = T.rend()
+    local base = 100 + index * 20
+    local tints = D == "arc" and { "Atl", "Atr" } or { "Atint" }
+    local fills = D == "arc" and { "Afl", "Afr" } or (D == "ring" and { "Afill" } or { "Acirc" })
+    local z0, z1 = 1 - zf, 1
+    if D == "arc" then z0, z1 = 0.5 - 0.5 * zf, 0.5 + 0.5 * zf end
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    -- Moving inside the zone: the tint and the zone in the clip color.
+    T.now = base + 2.5 T.fire("PLAYER_STARTED_MOVING") T.update()
+    local p = (T.now - base) / 2.8
+    local g = artGeom(D, r.w, r.h, db.dispThick, p)
+    local when = tag .. "moving in the zone: "
+    for _, key in ipairs(tints) do
+      local _, lo, hi = checkStrip(when, r, key, g[key], 0, D == "reticle" and 1 or p, { color = db.clipColor, alpha = 0.55 })
+      check(close(lo, 0, 1e-6) and close(hi, D == "reticle" and 1 or p, 1e-6), when .. key .. ": the tint in the clip color over the fill (" .. num(lo) .. " to " .. num(hi) .. ")")
+    end
+    if D ~= "reticle" then checkStrip(when, r, "Azone", g.Azone, z0, z1, { color = db.clipColor, alpha = db.activeAlpha * 0.85 }) end
+    T.now = base + 2.6 T.fire("PLAYER_STOPPED_MOVING") T.update()
+    p = (T.now - base) / 2.8
+    g = artGeom(D, r.w, r.h, db.dispThick, p)
+    when = tag .. "standing in the zone: "
+    for _, key in ipairs(tints) do checkStrip(when, r, key, g[key], 0, D == "reticle" and 1 or p, { color = db.color, alpha = 0.55 }) end
+    -- The bar runs out with no shot: hold at the shot, the fill full, pulsing past the grace.
+    local waitAt = base + 2.81
+    T.now = waitAt T.update()
+    check(T.stateHas("waiting for a late shot"), tag .. "holding for the shot")
+    for _, t in ipairs({ 3.0, 3.25 }) do
+      T.now = base + t T.update()
+      local pulse = pulseAt(T.now - waitAt)
+      g = artGeom(D, r.w, r.h, db.dispThick, 1)
+      when = tag .. "holding (pulse " .. num(pulse) .. "): "
+      for _, key in ipairs(fills) do
+        local _, lo, hi = checkStrip(when, r, key, g[key], 0, 1, { slice = "fill", alpha = pulse })
+        check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), when .. key .. ": the fill full (" .. num(lo) .. " to " .. num(hi) .. ")")
+      end
+      if D == "reticle" then
+        check(close(g.Acirc.rad, g.rmin, 1e-9), when .. "the circle at its smallest")
+      end
+      for _, key in ipairs(tints) do
+        local _, lo, hi = checkStrip(when, r, key, g[key], 0, 1, { color = db.color, alpha = 0.55 * pulse })
+        check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), when .. key .. ": the tint over all of it at 0.55 of the pulse")
+      end
+      if D ~= "reticle" then checkStrip(when, r, "Azone", g.Azone, z0, z1, { color = db.color, alpha = db.activeAlpha * pulse * 0.85 }) end
+    end
+    -- The late shot: a new swing, out of the zone, nothing tinted.
+    T.now = base + 3.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+    local tinted = 0
+    for _, key in ipairs(tints) do for i = 1, g[key].n do if T.isShown(T.part(r, key .. i)) then tinted = tinted + 1 end end end
+    check(tinted == 0, tag .. "after the shot: no tint (" .. tinted .. " segments)")
+    T.now = base + 3.9 T.update()
+    p = (T.now - base - 3.4) / 2.8
+    g = artGeom(D, r.w, r.h, db.dispThick, p)
+    if D ~= "reticle" then
+      checkStrip(tag .. "the next swing: ", r, "Azone", g.Azone, z0, z1, { color = db.color, alpha = db.idleAlpha * 0.85 })
+    end
+  end
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('Blizzard art (Line strips): the fill art covers exactly 0 to p along its path, not past it (and ends where the tint does)', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  for index, D in ipairs({ "arc", "ring" }) do
+    T.slash("display " .. D)
+    local r = T.rend()
+    local base = 100 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    for _, t in ipairs({ 0.9, 1.7, 2.55 }) do
+      T.now = base + t T.update()
+      local p = (T.now - base) / 2.8
+      local g = artGeom(D, r.w, r.h, db.dispThick, p)
+      local tints = D == "arc" and { "Atl", "Atr" } or { "Atint" }
+      for k, key in ipairs(D == "arc" and { "Afl", "Afr" } or { "Afill" }) do
+        local gk = g[key]
+        local lo, hi = stripSpan((readStrip(r, key, gk)))
+        local past = (hi or 0) - p
+        local deg = math.deg(past * math.abs(gk.a1 - gk.a0))
+        check(close(lo, 0, 1e-6) and close(hi, p, 1e-6), "[" .. D .. "] p " .. num(p) .. ": " .. key .. " from 0 to p (" .. num(lo) .. " to " .. num(hi)
+          .. ": " .. num(deg) .. " degrees, " .. num(past * math.abs(gk.a1 - gk.a0) * gk.rad) .. " px past p)")
+        if t > 2.3 then
+          local _, thi = stripSpan((readStrip(r, tints[k], g[tints[k]])))
+          check(close(thi, hi, 1e-6), "[" .. D .. "] p " .. num(p) .. ": the tint " .. tints[k] .. " ends where the fill art does (" .. num(thi) .. " and " .. num(hi) .. ")")
+        end
+      end
+    end
+  end
+  check(#T.errors == 0, "no errors")
+`);
+
+for (const D of ['arc', 'ring', 'reticle']) {
+  scenario('Blizzard art, Line strips (' + D + '): the background and frame strips are laid out once, not every frame; again after no swing duration, a resize, another design', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + 'local D = "' + D + '"\n' + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = D }
+  T.login(200)
+  local db = ShotWindowDB
+  local r = T.rend()
+  local S, F = STATIC[D], FILLS[D]
+  local tag = "[" .. D .. "] "
+  local function geomOK(label)
+    local g = artGeom(D, r.w, r.h, db.dispThick, 0)
+    for _, ks in ipairs(S) do
+      local _, lo, hi = checkStrip(tag .. label .. ": ", r, ks[1], g[ks[1]], 0, 1, { slice = ks[1] == "Abg" and "bg" or "frame", alpha = 1 })
+      check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), tag .. label .. ": " .. ks[1] .. " full length at " .. r.w .. "x" .. r.h)
+    end
+  end
+  T.update()
+  check(r.mode == "art", tag .. "drawn in the bar's art (" .. tostring(r.mode) .. ")")
+  local n0 = starts(r, S, D)
+  check(n0 == total(S) and shownAll(r, S), tag .. "idle at login: each static segment laid out once (" .. n0 .. " of " .. total(S) .. ") and shown")
+  for k = 1, 5 do T.now = T.now + 0.1 T.update() end
+  check(starts(r, S, D) == n0, tag .. "idle frames: not laid out again (" .. (starts(r, S, D) - n0) .. " more SetStartPoint calls)")
+
+  -- No swing duration: no ranged weapon, then a bow whose speed is secret (in combat).
+  T.speed.rng = nil
+  T.fire("PLAYER_EQUIPMENT_CHANGED", 18, true) T.update()
+  check(T.shownParts(r) == 0, tag .. "no ranged weapon: nothing shown (" .. T.shownParts(r) .. ")")
+  T.speed.rng = secret(2.8)
+  T.fire("PLAYER_EQUIPMENT_CHANGED", 18, false) T.update()
+  check(T.shownParts(r) == 0, tag .. "a secret weapon speed: still no duration, nothing shown (" .. T.shownParts(r) .. ")")
+  local n1 = starts(r, S, D)
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 100.5 T.update()
+  check(starts(r, S, D) - n1 == total(S) and shownAll(r, S), tag .. "the swing brings it back: laid out again (" .. (starts(r, S, D) - n1) .. " of " .. total(S) .. ") and shown")
+  geomOK("back from no duration")
+
+  -- A whole swing: the fill moves, the static strips stay put.
+  n1 = starts(r, S, D)
+  local f1 = starts(r, F, D)
+  for _, t in ipairs({ 1.0, 1.6, 2.2, 2.4 }) do T.now = 100 + t T.update() end
+  T.now = 102.5 T.fire("PLAYER_STARTED_MOVING") T.update()
+  T.now = 102.6 T.fire("PLAYER_STOPPED_MOVING") T.update()
+  T.now = 102.81 T.update() T.now = 103.0 T.update() T.now = 103.2 T.update()
+  T.now = 103.4 T.fire("PLAYER_SWING", 2.8, 2) T.update() T.now = 104 T.update()
+  check(starts(r, F, D) > f1, tag .. "the fill laid out as it moves (" .. (starts(r, F, D) - f1) .. " SetStartPoint calls)")
+  check(starts(r, S, D) == n1, tag .. "the zone, moving, the hold, the pulse and the late shot: the static strips not laid out again (" .. (starts(r, S, D) - n1) .. ")")
+  check(shownAll(r, S), tag .. "and still shown")
+
+  -- A resize from the options.
+  T.slash("")
+  T.click(T.tab(2))
+  T.drag(T.slider("Size of a round design"), 180)
+  n1 = starts(r, S, D)
+  T.now = 104.1 T.update()
+  check(r.w == 180 and starts(r, S, D) - n1 == total(S) and shownAll(r, S), tag .. "resized to 180: laid out again (" .. (starts(r, S, D) - n1) .. ") and shown")
+  geomOK("resized")
+  n1 = starts(r, S, D)
+  T.now = 104.2 T.update()
+  check(starts(r, S, D) == n1, tag .. "and left alone on the next frame (" .. (starts(r, S, D) - n1) .. ")")
+
+  -- Another design and back.
+  T.slash("display classic") T.now = 104.3 T.update()
+  check(r.design == "classic" and T.shownParts(r, D) == 0, tag .. "another design: nothing of " .. D .. " shown (" .. T.shownParts(r, D) .. ")")
+  n1 = starts(r, S, D)
+  T.slash("display " .. D) T.now = 104.4 T.update()
+  check(starts(r, S, D) - n1 == total(S) and shownAll(r, S), tag .. "back: laid out again (" .. (starts(r, S, D) - n1) .. ") and shown")
+  geomOK("back from another design")
+  T.slash("display classic") T.slash("display " .. D)
+  T.now = 104.5 T.update()
+  check(shownAll(r, S), tag .. "away and back with no frame drawn between: shown")
+  geomOK("away and back between frames")
+  check(#T.errors == 0, "no errors")
+`);
+}
+
+scenario('Blizzard art (Line strips): /shotwindow flipart swaps the top and bottom of every slice, and back', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  for index, D in ipairs({ "arc", "ring", "reticle" }) do
+    local tag = "[" .. D .. "] "
+    T.slash("display " .. D)
+    local r = T.rend()
+    local base = 100 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    local function artStrips(flip, label)
+      local p = (T.now - base) / 2.8
+      local g = artGeom(D, r.w, r.h, db.dispThick, p)
+      local list = { { "Arim", "frame", 1 }, { "Acirc", "fill", 1 } }
+      if D == "arc" then list = { { "Abg", "bg", 1 }, { "Aframe", "frame", 1 }, { "Afl", "fill", p }, { "Afr", "fill", p } }
+      elseif D == "ring" then list = { { "Abg", "bg", 1 }, { "Aframe", "frame", 1 }, { "Afill", "fill", p } } end
+      for _, s in ipairs(list) do
+        checkStrip(tag .. label .. ": ", r, s[1], g[s[1]], 0, s[3], { slice = s[2], alpha = s[2] == "fill" and 0.95 or 1, flip = flip })
+      end
+    end
+    T.now = base + 0.9 T.update()
+    artStrips(false, "the right way up")
+    local n = starts(r, STATIC[D], D)
+    T.slash("flipart")
+    check(db.artFlip == true and T.countSaid("Blizzard art on the round designs flipped") == index, tag .. "/shotwindow flipart: flipped, and says so")
+    T.now = base + 1.0 T.update()
+    check(starts(r, STATIC[D], D) - n == total(STATIC[D]), tag .. "flipped: the static strips laid out again at once (" .. (starts(r, STATIC[D], D) - n) .. ")")
+    artStrips(true, "flipped")
+    T.slash("flipart")
+    check(db.artFlip == false and T.countSaid("Blizzard art on the round designs the right way up") == index, tag .. "again: the right way up, and says so")
+    T.now = base + 1.1 T.update()
+    artStrips(false, "flipped back")
+  end
+  -- The preview: a slash command does not resize it, so the flip itself must lay its strips out again.
+  T.slash("display ring")
+  T.slash("")
+  T.click(T.tab(2))
+  local pr = T.preview(T.pages()[2]).renderer
+  local function previewStatic(flip, label)
+    local g = artGeom("ring", pr.w, pr.h, db.dispThick, 0)
+    check(pr.design == "ring" and pr.mode == "art", "[ring] preview " .. label .. ": in the bar's art")
+    for _, key in ipairs({ "Abg", "Aframe" }) do
+      checkStrip("[ring] preview " .. label .. ": ", pr, key, g[key], 0, 1, { slice = key == "Abg" and "bg" or "frame", alpha = 1, flip = flip })
+    end
+  end
+  T.now = 200 T.update() T.now = 200.1 T.update()
+  previewStatic(false, "the right way up")
+  T.slash("flipart") T.now = 200.2 T.update()
+  previewStatic(true, "flipped")
+  T.slash("flipart") T.now = 200.3 T.update()
+  previewStatic(false, "flipped back")
+  check(#T.errors == 0, "no errors")
+`);
+
+// The fallbacks: the round designs drawn flat, as before the art, with nothing of it left over.
+const ART_FALLBACK = String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  if FB == "dark" then ShotWindowDB = { style = "dark" } end
+  if FB == "missing" or FB == "nil" or FB == "error" then T.atlasMode = FB end
+  if FB == "squares" then T.noLines = true end
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  check(FB ~= "dark" or NS.Styles.Applied() == "dark", "Dark drawn")
+  local FLAT = { arc = { "tl", "fl" }, ring = { "t", "f" }, reticle = { "c" } }
+  for index, D in ipairs({ "arc", "ring", "reticle" }) do
+    local tag = "[" .. D .. "] "
+    local errs = #T.errors
+    T.slash("display " .. D)
+    local r = T.rend()
+    local base = 100 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    local function flatNow(when)
+      check(r.mode == "flat", tag .. when .. ": drawn flat (" .. tostring(r.mode) .. ")")
+      check(textured(r) == 0 and artShown(r, D) == 0, tag .. when .. ": no art anywhere (" .. textured(r) .. " textured lines, " .. artShown(r, D) .. " art segments shown)")
+      for _, k in ipairs(FLAT[D]) do check(T.isShown(T.part(r, k .. "1")), tag .. when .. ": the flat " .. k .. " drawn") end
+    end
+    T.now = base + 1.0 T.update() flatNow("before the zone")
+    T.now = base + 2.5 T.update() flatNow("in the zone")
+    T.now = base + 2.81 T.update() T.now = base + 3.0 T.update() flatNow("holding")
+    T.now = base + 3.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+    check(#T.errors == errs, tag .. "no Lua errors (" .. (#T.errors - errs) .. ")")
+  end
+  check(#T.atlasQueries <= 3, "the atlases looked up once at most, never every frame (" .. #T.atlasQueries .. " queries)")
+  if FB == "missing" then check(#T.atlasQueries == 0, "no GetAtlasInfo: nothing asked") end
+  if FB == "squares" then
+    check(T.debugSays("display: Tightening reticle, locked, shown, squares, flat (no way to bend the art), line strips"), "debug: squares, no way to bend the art")
+  else
+    local why = FB == "dark" and "flat (a drawn window style)" or "flat (no atlas info)"
+    check(T.debugSays("display: Tightening reticle, locked, shown, lines, " .. why .. ", line strips"), "debug: " .. why .. ", line strips")
+  end
+  check(#T.errors == 0, "no errors")
+`;
+for (const [fb, label] of [['dark', 'the Dark style'], ['missing', 'no C_Texture.GetAtlasInfo'], ['nil', 'GetAtlasInfo answers nothing'],
+  ['error', 'GetAtlasInfo raises'], ['squares', 'no CreateLine']]) {
+  scenario('Blizzard art fallback, Line strips (' + label + '): the round designs drawn flat through a fight, without errors', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + 'local FB = "' + fb + '"\n' + ART_FALLBACK);
+}
+
+scenario('Blizzard art (Line strips): Dark chosen live hides the art and draws the round designs flat at once', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "ring" }
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  local r = T.rend()
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  check(r.mode == "art" and artShown(r, "ring") > 0, "Blizzard: the ring in the bar's art (" .. artShown(r, "ring") .. " art segments)")
+  T.slash("style dark")
+  check(NS.Styles.Applied() == "dark", "Dark drawn at once")
+  T.now = 101.1 T.update()
+  check(r.mode == "flat" and artShown(r, "ring") == 0, "Dark: no art left shown (" .. tostring(r.mode) .. ", " .. artShown(r, "ring") .. ")")
+  check(T.isShown(T.part(r, "t1")) and T.isShown(T.part(r, "f1")), "Dark: the flat track and fill drawn")
+  for _, D in ipairs({ "arc", "reticle" }) do
+    T.slash("display " .. D) T.now = T.now + 0.1 T.update()
+    check(r.mode == "flat" and artShown(r, D) == 0, D .. ": flat, no art")
+  end
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('Blizzard art (Line strips): the preview in the options wears the same art as the display', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  T.slash("")
+  T.click(T.tab(2))
+  local box = T.preview(T.pages()[2])
+  local pr = box and box.renderer
+  check(pr ~= nil, "a preview on the Display page")
+  -- The ring again last: the reticle is the same size, so the preview is not resized on the way
+  -- back and only the design change can bring its strips back.
+  for index, D in ipairs({ "arc", "ring", "reticle", "ring" }) do
+    local tag = "[" .. D .. "] preview: "
+    T.slash("display " .. D)
+    local base = 100 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    local dr = T.rend()
+    local fillSeen = 0
+    for k = 1, 12 do
+      T.now = base + k * 0.25 T.update()
+      check(pr.design == D and pr.mode == "art" and dr.mode == "art", tag .. "in the bar's art at " .. num(k * 0.25) .. " s (" .. tostring(pr.design) .. " " .. tostring(pr.mode) .. ")")
+      for _, ks in ipairs(FILLS[D]) do
+        local g = artGeom(D, pr.w, pr.h, db.dispThick, 0)[ks[1]]
+        local segs = checkStrip(tag .. num(k * 0.25) .. " s: ", pr, ks[1], g, 0, nil, { slice = "fill", anyRadius = D == "reticle" })
+        fillSeen = fillSeen + #segs
+      end
+    end
+    check(fillSeen > 0, tag .. "its fill art drawn (" .. fillSeen .. " segments over 12 frames)")
+    check(pr.w == dr.w and pr.h == dr.h, tag .. "drawn at the display's size (" .. pr.w .. "x" .. pr.h .. ")")
+    local g = artGeom(D, pr.w, pr.h, db.dispThick, 0)
+    local differ = {}
+    for _, ks in ipairs(STATIC[D]) do
+      local _, lo, hi = checkStrip(tag, pr, ks[1], g[ks[1]], 0, 1, { slice = ks[1] == "Abg" and "bg" or "frame", alpha = 1 })
+      check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), tag .. ks[1] .. " full length")
+      for i = 1, ks[2] do
+        local a, b = T.part(pr, ks[1] .. i), T.part(dr, ks[1] .. i)
+        local same = a and b and rawget(a, "file") == rawget(b, "file") and close(rawget(a, "thickness"), rawget(b, "thickness"), 1e-9)
+        local ta, tb = a and rawget(a, "texCoord"), b and rawget(b, "texCoord")
+        for j = 1, 4 do same = same and ta and tb and close(ta[j], tb[j], 1e-12) end
+        local sa, sb, ea, eb = a and rawget(a, "startPoint"), b and rawget(b, "startPoint"), a and rawget(a, "endPoint"), b and rawget(b, "endPoint")
+        same = same and sa and sb and ea and eb and close(sa[3], sb[3], 1e-9) and close(sa[4], sb[4], 1e-9) and close(ea[3], eb[3], 1e-9) and close(ea[4], eb[4], 1e-9)
+        if not same then differ[#differ + 1] = ks[1] .. i end
+      end
+    end
+    check(#differ == 0, tag .. "the background and frame exactly as on the display (not: " .. table.concat(differ, ", ") .. ")")
+  end
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('Blizzard art: with no CreateLine (and no vertex offsets) under the Blizzard style the debug line does not blame a window style', DISPLAY_HELPERS + LINE_STRIPS + String.raw`
+  T.noLines = true
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "ring" }
+  T.login(200)
+  T.update()
+  check(NS.Styles.Applied() == nil, "the Blizzard style")
+  local n = #T.prints
+  T.slash("debug")
+  local line
+  for i = n + 1, #T.prints do if T.prints[i]:find("display: ", 1, true) then line = T.prints[i] end end
+  check(line ~= nil and line:find("squares", 1, true) ~= nil, "the display line says squares (" .. tostring(line) .. ")")
+  check(line ~= nil and line:find("a drawn window style", 1, true) == nil, "and does not give a drawn window style as the reason it is flat (" .. tostring(line) .. ")")
+  check(line ~= nil and line:find("flat (no way to bend the art)", 1, true) ~= nil, "it says there is no way to bend the art (" .. tostring(line) .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+// ---------------------------------------------------------------------------------------------
+// Seamless strips: with Texture:SetVertexOffset (the default in these stubs) the round designs draw
+// every curve as textures whose four corners are moved onto the strip's outer and inner circles
+// (1 upper left = outer at the segment's start, 2 lower left = inner at its start, 3 upper right =
+// outer at its end, 4 lower right = inner at its end), so neighbors share corners and nothing
+// overlaps. A piece clipped by the strip's from/to keeps its full segment's outline: its clipped
+// corners lie on that segment's chords, (t - s0) * n of the way along, so every layer drawn over
+// the same segment shares one outline. Pixel snapping is off on every strip texture.
+
+// Lua helpers for the seamless strip scenarios (they follow DISPLAY_HELPERS).
+const QUAD_HELPERS = ROUND_GEOM + String.raw`
+  local Q_FRAME_K, TWO_PI, TOP = 30 / 22, 2 * math.pi, math.pi / 2
+  local QSLICE = { bg = "ui-swingtimerbar-background", fill = "ui-swingtimerbar-filling-ranged", frame = "ui-swingtimerbar-frame" }
+
+  -- The look the flat strips are painted in: the window style's track and move color.
+  local function quadLook(db)
+    if NS.Styles.Applied() then
+      local r, g, b = NS.Styles.S.GetPanelColor()
+      return { track = { r, g, b, 0.85 }, move = db.moveAccent and { NS.Styles.S.GetAccentColor() } or db.moveColor }
+    end
+    return { track = { 0.05, 0.05, 0.06, 0.6 }, move = db.moveColor }
+  end
+
+  -- Every strip a round design draws, worked out from its size and the clock alone: in drawing
+  -- order, each with its key (its textures are key .. i), center, radius, thickness, path (angle a0
+  -- to a1, counterclockwise from the right, y up), segments, sublevel, the part from .. to that is
+  -- drawn, and its paint: an atlas slice (art) or a color (flat), and the alpha. st: p (the swing's
+  -- progress), lit, clipping, pulse, idle. mode: "art" (the bar's art) or "flat". Also returns the
+  -- strips by key, and info: for the arc and the ring their roundGeom (capped line thickness th,
+  -- radius, the shot mark's radii); for the reticle its rim, rim radius, smallest and largest
+  -- radius, the circle's radius and drawn thickness ct, and its ticks: from r0 (the circle's outer
+  -- edge) len long, never past edge, shown only when len is at least min(4, full).
+  local function quadStrips(D, mode, W, H, db, st, look)
+    local th, zf, p = db.dispThick, 0.5 / 2.8, st.p
+    local pulse = st.pulse or 1
+    local zoneC = st.clipping and db.clipColor or db.color
+    local zoneA = ((st.lit and db.flash) and db.activeAlpha or db.idleAlpha) * pulse
+    local fillC = st.lit and zoneC or look.move
+    local fillA = st.lit and pulse or 0.95
+    local tintA = st.lit and 0.55 * pulse or 0
+    local list, by, info = {}, {}, {}
+    local function S(key, cx, cy, rad, thick, a0, a1, n, sub, from, to, paint)
+      local g = { key = key, cx = cx, cy = cy, rad = rad, thick = thick, a0 = a0, a1 = a1, n = n, sub = sub,
+        from = from, to = to, slice = paint.slice, color = paint.color, alpha = paint.alpha }
+      list[#list + 1] = g
+      by[key] = g
+    end
+    local left, right, fin = TOP + math.rad(110), TOP - math.rad(110), TOP - TWO_PI
+    if D ~= "reticle" then
+      info = roundGeom(D, mode, W, H, th)
+      th = info.th -- capped to the size
+    end
+    if D == "arc" and mode == "art" then
+      local fw, bw = info.fw, info.bw
+      local cx, cy, rad = info.cx, info.cy, info.rad
+      S("QAbg", cx, cy, rad, bw, left, right, 44, 0, 0, 1, { slice = "bg", alpha = 1 })
+      S("QAzone", cx, cy, rad, bw, left, right, 44, 1, 0.5 - 0.5 * zf, 0.5 + 0.5 * zf, { color = zoneC, alpha = zoneA * 0.85 })
+      S("QAfl", cx, cy, rad, th, left, TOP, 22, 2, 0, p, { slice = "fill", alpha = fillA })
+      S("QAfr", cx, cy, rad, th, right, TOP, 22, 2, 0, p, { slice = "fill", alpha = fillA })
+      S("QAtl", cx, cy, rad, th, left, TOP, 22, 3, 0, p, { color = fillC, alpha = tintA })
+      S("QAtr", cx, cy, rad, th, right, TOP, 22, 3, 0, p, { color = fillC, alpha = tintA })
+      S("QAframe", cx, cy, rad, fw, left, right, 44, 4, 0, 1, { slice = "frame", alpha = 1 })
+    elseif D == "ring" and mode == "art" then
+      local fw, bw = info.fw, info.bw
+      local cx, cy, rad = info.cx, info.cy, info.rad
+      S("QAbg", cx, cy, rad, bw, TOP, fin, 40, 0, 0, 1, { slice = "bg", alpha = 1 })
+      S("QAzone", cx, cy, rad, bw, TOP, fin, 40, 1, 1 - zf, 1, { color = zoneC, alpha = zoneA * 0.85 })
+      S("QAfill", cx, cy, rad, th, TOP, fin, 40, 2, 0, p, { slice = "fill", alpha = fillA })
+      S("QAtint", cx, cy, rad, th, TOP, fin, 40, 3, 0, p, { color = fillC, alpha = tintA })
+      S("QAframe", cx, cy, rad, fw, TOP, fin, 40, 4, 0, 1, { slice = "frame", alpha = 1 })
+    elseif D == "arc" then
+      local cx, cy, rad = info.cx, info.cy, info.rad
+      S("Qtlt", cx, cy, rad, th, left, TOP, 22, 0, 0, 1 - zf, { color = look.track, alpha = look.track[4] })
+      S("Qtlz", cx, cy, rad, th, left, TOP, 22, 0, 1 - zf, 1, { color = zoneC, alpha = zoneA })
+      S("Qtrt", cx, cy, rad, th, right, TOP, 22, 0, 0, 1 - zf, { color = look.track, alpha = look.track[4] })
+      S("Qtrz", cx, cy, rad, th, right, TOP, 22, 0, 1 - zf, 1, { color = zoneC, alpha = zoneA })
+      S("Qfl", cx, cy, rad, th, left, TOP, 22, 2, 0, p, { color = fillC, alpha = fillA })
+      S("Qfr", cx, cy, rad, th, right, TOP, 22, 2, 0, p, { color = fillC, alpha = fillA })
+    elseif D == "ring" then
+      local cx, cy, rad = info.cx, info.cy, info.rad
+      S("Qtt", cx, cy, rad, th, TOP, fin, 40, 0, 0, 1 - zf, { color = look.track, alpha = look.track[4] })
+      S("Qtz", cx, cy, rad, th, TOP, fin, 40, 0, 1 - zf, 1, { color = zoneC, alpha = zoneA })
+      S("Qf", cx, cy, rad, th, TOP, fin, 40, 2, 0, p, { color = fillC, alpha = fillA })
+    else -- the reticle
+      local t = math.max(2, th / 2)
+      local half = math.min(W, H) / 2
+      local cx, cy = W / 2, H / 2
+      -- The rim (art only) as wide as fits after the circle's own travel; the circle never thicker
+      -- than 0.8 of its radius.
+      local rim = mode == "art" and math.max(0, math.min(t * Q_FRAME_K * 1.4, half - t - 2 - 12)) or 0
+      local rmax = half - t - 2 - rim
+      local rmin = math.max(4, rmax * 0.12)
+      local rad = rmin + (rmax - rmin) * (1 - p)
+      local zrad = rmin + (rmax - rmin) * zf
+      local rimR = half - rim / 2 - 1
+      -- The circle's drawn thickness: the line's (1.4 of it in art), never more than 0.8 of its radius.
+      local ct = mode == "art" and math.min(t * 1.4, rad * 0.8) or math.min(t, rad * 0.8)
+      if mode == "art" then
+        S("QArim", cx, cy, rimR, rim, TOP, fin, 40, 0, 0, 1, { slice = "frame", alpha = rim >= 2 and 1 or 0 })
+        S("QAcirc", cx, cy, rad, ct, TOP, fin, 32, 2, 0, 1, { slice = "fill", alpha = st.idle and 0.6 or fillA })
+        S("QAtint", cx, cy, rad, ct, TOP, fin, 32, 3, 0, 1, { color = fillC, alpha = tintA })
+      end
+      S("Qz", cx, cy, zrad, 1.5, 0, TWO_PI, 32, 4, 0, 1, { color = zoneC, alpha = math.max(zoneA, 0.3) })
+      if mode ~= "art" then
+        S("Qc", cx, cy, rad, ct, 0, TWO_PI, 32, 2, 0, 1, { color = fillC, alpha = st.idle and 0.5 or fillA })
+      end
+      -- The ticks start at the circle's drawn outer edge and stop 1 short of the rim's inner edge
+      -- (art, the rim shown) or of the frame's edge.
+      local r0, full = rad + ct / 2, rmax * 0.18
+      local edge = (mode == "art" and rim >= 2) and (rimR - rim / 2 - 1) or (half - 1)
+      local len = math.min(full, edge - r0)
+      info = { rim = rim, rimR = rimR, rmin = rmin, rmax = rmax, rad = rad, half = half, ct = ct, cx = cx, cy = cy,
+        r0 = r0, full = full, edge = edge, len = len, ticks = len >= math.min(4, full) }
+    end
+    return list, by, info
+  end
+
+  local function same(c, d, tol) return type(c) == "table" and type(d) == "table" and math.abs(c[1] - d[1]) <= tol and math.abs(c[2] - d[2]) <= tol end
+  local function cstr(c) if type(c) ~= "table" then return tostring(c) end return "(" .. num(c[1]) .. ", " .. num(c[2]) .. ")" end
+  -- A point's place along strip g's path, as a fraction from a0 to a1, from its angle about the
+  -- center unwound next to aim.
+  local function fracAt(g, x, y, aim)
+    local a = math.atan(y - g.cy, x - g.cx)
+    while a - aim > math.pi do a = a - TWO_PI end
+    while aim - a > math.pi do a = a + TWO_PI end
+    return (a - g.a0) / (g.a1 - g.a0)
+  end
+
+  -- Segment i of strip g whole: its four corners on the circles, in the client's order (1 outer and
+  -- 2 inner where it starts, 3 outer and 4 inner where it ends).
+  local function fullCorners(g, i)
+    local ro, ri = g.rad + g.thick / 2, math.max(0, g.rad - g.thick / 2)
+    local A0, A1 = g.a0 + (g.a1 - g.a0) * (i - 1) / g.n, g.a0 + (g.a1 - g.a0) * i / g.n
+    return { { g.cx + ro * math.cos(A0), g.cy + ro * math.sin(A0) }, { g.cx + ri * math.cos(A0), g.cy + ri * math.sin(A0) },
+      { g.cx + ro * math.cos(A1), g.cy + ro * math.sin(A1) }, { g.cx + ri * math.cos(A1), g.cy + ri * math.sin(A1) } }
+  end
+  local function lerp2(p, q, u) return { (1 - u) * p[1] + u * q[1], (1 - u) * p[2] + u * q[2] } end
+  -- Where point x lies along the chord from p to q (0 at p, 1 at q), and how far off that line.
+  local function chordAt(p, q, x)
+    local dx, dy = q[1] - p[1], q[2] - p[2]
+    local L2 = dx * dx + dy * dy
+    if L2 <= 0 then return nil, nil end
+    return ((x[1] - p[1]) * dx + (x[2] - p[2]) * dy) / L2, math.abs((x[1] - p[1]) * dy - (x[2] - p[2]) * dx) / math.sqrt(L2)
+  end
+
+  -- Every check on one seamless strip g (from quadStrips): which segments show; at an end of a piece
+  -- that from/to does not clip, corners 1 and 3 on the outer circle and 2 and 4 on the inner one
+  -- (within 1e-6), 1 and 2 where the segment starts along the path and 3 and 4 where it ends; at a
+  -- clipped end (t0 > s0 or t1 < s1, s0 = (i - 1) / n, s1 = i / n) the two corners on the full
+  -- segment's outer and inner chords, u = (t - s0) * n of the way along (within 1e-6); neighbors
+  -- sharing their corners (within 1e-9), no overlap, the strip covering exactly from .. to (each
+  -- end's place along the path: its angle when unclipped, s0 + u / n along its chord when clipped),
+  -- the draw layer, and the paint: art wears the atlas file with its u following that place and its
+  -- top on the outer corners (bottom when flipped), white at the alpha; flat is SetColorTexture in
+  -- the color at the alpha. Returns the shown segments in order, each { i, c (its corners), f0, f1
+  -- (path fractions), clipped (either end) }.
+  local function checkQuads(tag, r, g, flip)
+    local label = tag .. g.key .. ": "
+    local ro, ri = g.rad + g.thick / 2, math.max(0, g.rad - g.thick / 2)
+    local segs, expect, nClipped = {}, 0, 0
+    local vis, anchors, outer, inner, along, chord, layer, paint = {}, {}, {}, {}, {}, {}, {}, {}
+    local l, rr, t, b
+    if g.slice then l, rr, t, b = T.atlasCoords(QSLICE[g.slice]) end
+    for i = 1, g.n do
+      local tex = T.part(r, g.key .. i)
+      local s0, s1 = (i - 1) / g.n, i / g.n
+      local t0, t1 = math.max(s0, g.from), math.min(s1, g.to)
+      local want = t1 > t0 and g.alpha > 0
+      if want then expect = expect + 1 end
+      if T.isShown(tex) ~= want then vis[#vis + 1] = i .. (want and " hidden" or " shown") end
+      local c = want and T.isShown(tex) and T.quadCorners(tex)
+      if c and type(c) ~= "table" then anchors[#anchors + 1] = i .. " (" .. tostring(c) .. ")" end
+      if type(c) == "table" then
+        local aim = g.a0 + (g.a1 - g.a0) * (i - 0.5) / g.n
+        local F = fullCorners(g, i)
+        local fEnd = {}
+        -- e = 1: the start (corners 1 and 2), e = 2: the end (corners 3 and 4).
+        for e = 1, 2 do
+          local ko, ki = 2 * e - 1, 2 * e
+          local tt = e == 1 and t0 or t1
+          local clipped = (e == 1 and t0 > s0) or (e == 2 and t1 < s1)
+          if clipped then
+            local u = (tt - s0) * g.n
+            local wo, wi = lerp2(F[1], F[3], u), lerp2(F[2], F[4], u)
+            local uo, offO = chordAt(F[1], F[3], c[ko])
+            local ui, offI = chordAt(F[2], F[4], c[ki])
+            if not (same(c[ko], wo, 1e-6) and same(c[ki], wi, 1e-6)) then
+              chord[#chord + 1] = i .. (e == 1 and " start" or " end") .. " at " .. num(uo) .. "/" .. num(ui) .. " along, " .. num(offO) .. "/" .. num(offI)
+                .. " off its chords (want " .. num(u) .. ")"
+            end
+            fEnd[e] = uo and (s0 + uo / g.n) or nil
+          else
+            local dO, dI = dist(c[ko][1], c[ko][2], g.cx, g.cy), dist(c[ki][1], c[ki][2], g.cx, g.cy)
+            if not close(dO, ro, 1e-6) then outer[#outer + 1] = i .. " corner " .. ko .. " at " .. num(dO) end
+            if not close(dI, ri, 1e-6) then inner[#inner + 1] = i .. " corner " .. ki .. " at " .. num(dI) end
+            local fo = dO > 1e-6 and fracAt(g, c[ko][1], c[ko][2], aim) or nil
+            local fi = dI > 1e-6 and fracAt(g, c[ki][1], c[ki][2], aim) or nil
+            if not (fo and close(fo, tt, 1e-6) and (fi == nil or close(fi, tt, 1e-6))) then
+              along[#along + 1] = i .. " corners " .. ko .. "/" .. ki .. " at " .. num(fo) .. "/" .. num(fi) .. ", want " .. num(tt)
+            end
+            fEnd[e] = fo
+          end
+        end
+        local f0, f1 = fEnd[1], fEnd[2]
+        local clippedHere = t0 > s0 or t1 < s1
+        if clippedHere then nClipped = nClipped + 1 end
+        if rawget(tex, "layer") ~= "ARTWORK" or rawget(tex, "sublevel") ~= g.sub then
+          layer[#layer + 1] = i .. "=" .. tostring(rawget(tex, "layer")) .. " " .. tostring(rawget(tex, "sublevel"))
+        end
+        if g.slice then
+          local tc, v = rawget(tex, "texCoord"), rawget(tex, "vertex")
+          local top, bottom = t, b
+          if flip then top, bottom = b, t end
+          local ok = rawget(tex, "file") == T.atlasFile and rawget(tex, "texCoordArgs") == 4 and type(tc) == "table"
+          local u0, u1 = ok and (tc[1] - l) / (rr - l), ok and (tc[2] - l) / (rr - l)
+          ok = ok and close(u0, f0 or -1, 1e-6) and close(u1, f1 or -1, 1e-6) and close(tc[3], top, 1e-12) and close(tc[4], bottom, 1e-12)
+            and type(v) == "table" and close(v[1], 1, 1e-9) and close(v[2], 1, 1e-9) and close(v[3], 1, 1e-9) and close(v[4], g.alpha, 1e-6)
+          if not ok then
+            paint[#paint + 1] = i .. " (file " .. tostring(rawget(tex, "file")) .. ", u " .. num(u0) .. " to " .. num(u1) .. " lying at " .. num(f0) .. " to " .. num(f1)
+              .. ", v " .. num(type(tc) == "table" and tc[3]) .. " to " .. num(type(tc) == "table" and tc[4]) .. ", vertex " .. rgbStr(v) .. "/" .. num(type(v) == "table" and v[4]) .. ")"
+          end
+        else
+          local cc = rawget(tex, "colorTex")
+          if not (type(cc) == "table" and sameRGB(cc, g.color) and close(cc[4], g.alpha, 1e-6) and rawget(tex, "file") == nil) then
+            paint[#paint + 1] = i .. "=" .. rgbStr(cc) .. "/" .. num(type(cc) == "table" and cc[4]) .. " file " .. tostring(rawget(tex, "file"))
+          end
+        end
+        segs[#segs + 1] = { i = i, c = c, f0 = f0 or t0, f1 = f1 or t1, clipped = clippedHere }
+      end
+    end
+    check(#vis == 0, label .. expect .. " segments shown, the rest hidden (not: " .. table.concat(vis, ", ") .. ")")
+    check(#anchors == 0, label .. "every segment anchored by its CENTER on its frame's BOTTOMLEFT (not: " .. table.concat(anchors, ", ") .. ")")
+    check(#outer == 0, label .. "unclipped ends: corners 1 and 3 on the outer circle, radius " .. num(ro) .. " (not: " .. table.concat(outer, ", ") .. ")")
+    check(#inner == 0, label .. "unclipped ends: corners 2 and 4 on the inner circle, radius " .. num(ri) .. " (not: " .. table.concat(inner, ", ") .. ")")
+    check(#along == 0, label .. "unclipped ends: corners 1 and 2 where the segment starts along the path, 3 and 4 where it ends (not: " .. table.concat(along, "; ") .. ")")
+    check(#chord == 0, label .. nClipped .. " clipped pieces: each clipped end on its full segment's outer and inner chords, (t - s0) * n of the way along (not: "
+      .. table.concat(chord, "; ") .. ")")
+    check(#layer == 0, label .. "ARTWORK sublevel " .. g.sub .. " (not: " .. table.concat(layer, ", ") .. ")")
+    if g.slice then
+      check(#paint == 0, label .. "the slice of " .. QSLICE[g.slice] .. " for where each segment lies, its " .. (flip and "bottom" or "top")
+        .. " on the outer corners, white at alpha " .. num(g.alpha) .. " (not: " .. table.concat(paint, "; ") .. ")")
+    else
+      check(#paint == 0, label .. "flat " .. rgbStr(g.color) .. " at alpha " .. num(g.alpha) .. " (not: " .. table.concat(paint, ", ") .. ")")
+    end
+    -- Neighbors share their corners and nothing overlaps; the strip covers exactly from .. to.
+    local shared, over = {}, {}
+    for k = 1, #segs do
+      local s = segs[k]
+      if not (s.f1 > s.f0) then over[#over + 1] = s.i .. " runs backwards" end
+      if k > 1 then
+        local a = segs[k - 1]
+        if s.i ~= a.i + 1 or not (same(a.c[3], s.c[1], 1e-9) and same(a.c[4], s.c[2], 1e-9)) then
+          shared[#shared + 1] = a.i .. "|" .. s.i .. " " .. cstr(a.c[3]) .. " " .. cstr(s.c[1])
+        end
+        if s.f0 < a.f1 - 1e-9 then over[#over + 1] = a.i .. "|" .. s.i .. " by " .. num(a.f1 - s.f0) end
+      end
+    end
+    check(#shared == 0, label .. "each segment starts exactly where the one before it ends (not: " .. table.concat(shared, ", ") .. ")")
+    check(#over == 0, label .. "no overlap along the path (" .. table.concat(over, ", ") .. ")")
+    if #segs > 0 then
+      check(close(segs[1].f0, g.from, 1e-6) and close(segs[#segs].f1, g.to, 1e-6), label .. "covers exactly " .. num(g.from) .. " to "
+        .. num(g.to) .. " of its path (" .. num(segs[1].f0) .. " to " .. num(segs[#segs].f1) .. ")")
+    end
+    return segs
+  end
+
+  -- Pixel snapping off on every seamless strip texture of renderer r (of design D; nil: every
+  -- design): SetSnapToPixelGrid(false) and SetTexelSnappingBias(0), each exactly once, made before
+  -- its corners were first moved. Returns how many strip textures r has (of D).
+  local function snapOnce(label, r, D)
+    local bad, n = {}, 0
+    for name, t in pairs(r.tex) do
+      local design, k = name:match("^([^:]+):(Q.*)$")
+      if k and (D == nil or design == D) then
+        n = n + 1
+        if not (rawget(t, "snapCalls") == 1 and rawget(t, "snapToPixelGrid") == false and rawget(t, "snapAt") == 0
+          and rawget(t, "texelBiasCalls") == 1 and rawget(t, "texelBias") == 0 and rawget(t, "texelAt") == 0) then
+          bad[#bad + 1] = name .. " (snap " .. tostring(rawget(t, "snapToPixelGrid")) .. " x" .. tostring(rawget(t, "snapCalls")) .. " after "
+            .. tostring(rawget(t, "snapAt")) .. " offsets, bias " .. tostring(rawget(t, "texelBias")) .. " x" .. tostring(rawget(t, "texelBiasCalls"))
+            .. " after " .. tostring(rawget(t, "texelAt")) .. ")"
+        end
+      end
+    end
+    table.sort(bad)
+    local shown = {}
+    for k = 1, math.min(#bad, 6) do shown[k] = bad[k] end
+    check(n > 0 and #bad == 0, label .. "pixel snapping off on all " .. n .. " strip textures: SetSnapToPixelGrid(false) and SetTexelSnappingBias(0) once each,"
+      .. " before their corners first moved (" .. #bad .. " not: " .. table.concat(shown, ", ") .. ")")
+    return n
+  end
+  -- Strip textures over every renderer made, and SetSnapToPixelGrid / SetTexelSnappingBias calls in
+  -- all: each texture turned once, so the counts match.
+  local function snapTotals()
+    local n = 0
+    for _, rr in ipairs(T.renderers or {}) do
+      for name in pairs(rr.tex) do if name:find("^[^:]+:Q") then n = n + 1 end end
+    end
+    return n, T.snapCalls or 0, T.texelBiasCalls or 0
+  end
+
+  -- Every strip of a design checked; the shown segments by key. Pixel snapping checked too (unless
+  -- the client has no such methods: T.noPixelSnap).
+  local function checkAll(tag, r, list, flip)
+    local segs = {}
+    for _, g in ipairs(list) do segs[g.key] = checkQuads(tag, r, g, flip) end
+    if not T.noPixelSnap then snapOnce(tag, r, r.design) end
+    return segs
+  end
+  -- How many pieces clipped by from/to were checked among the shown segments.
+  local function clippedCount(segs)
+    local n = 0
+    for _, list in pairs(segs) do for _, s in ipairs(list) do if s.clipped then n = n + 1 end end end
+    return n
+  end
+  -- Layers over the same segments share one outline: every shown piece of strip top lies on the
+  -- piece of strip base over the same segment (whole, or clipped the same way): its corners 1 and 3
+  -- on base's outer edge (base's corners 1 to 3), 2 and 4 on its inner edge (2 to 4).
+  local function onOutline(label, top, base)
+    local byI, bad = {}, {}
+    for _, s in ipairs(base or {}) do byI[s.i] = s end
+    local function onEdge(p, a, b)
+      local u, off = chordAt(a, b, p)
+      return u ~= nil and u >= -1e-9 and u <= 1 + 1e-9 and off <= 1e-6
+    end
+    for _, s in ipairs(top or {}) do
+      local q = byI[s.i]
+      if not (q and onEdge(s.c[1], q.c[1], q.c[3]) and onEdge(s.c[3], q.c[1], q.c[3]) and onEdge(s.c[2], q.c[2], q.c[4]) and onEdge(s.c[4], q.c[2], q.c[4])) then
+        bad[#bad + 1] = tostring(s.i)
+      end
+    end
+    check(top ~= nil and #top > 0 and #bad == 0, label .. " (" .. #(top or {}) .. " pieces; not: " .. table.concat(bad, ", ") .. ")")
+  end
+  -- The reticle's four ticks (info from quadStrips): Lines at ARTWORK 5 on the axes (right, up, left,
+  -- down), each from the circle's drawn outer edge r0 out len, never past edge; hidden rather than
+  -- shorter than min(4, rmax * 0.18). circ: the circle's strip key, whose first corner (on the
+  -- right or at the top, both axes) gives the outer edge as drawn.
+  local function checkTicks(when, r, info, circ)
+    local bad, past = {}, {}
+    local c = T.quadCorners(T.part(r, circ .. "1"))
+    local drawnEdge = type(c) == "table" and dist(c[1][1], c[1][2], info.cx, info.cy) or nil
+    check(drawnEdge ~= nil and close(drawnEdge, info.r0, 1e-6), when .. "the circle's drawn outer edge at rad + ct / 2 = " .. num(info.r0) .. " (" .. num(drawnEdge) .. ")")
+    for i, a in ipairs({ 0, TOP, math.pi, 3 * TOP }) do
+      local tick = T.part(r, "tick" .. i)
+      local shown = T.isShown(tick)
+      if not (tick and rawget(tick, "kind") == "Line" and rawget(tick, "layer") == "ARTWORK" and rawget(tick, "sublevel") == 5) then
+        bad[#bad + 1] = i .. " not a Line at ARTWORK 5"
+      elseif shown ~= info.ticks then
+        bad[#bad + 1] = i .. (shown and " shown" or " hidden")
+      elseif shown then
+        local x1, y1, x2, y2 = T.segEnds(tick)
+        local d1, d2 = dist(x1, y1, info.cx, info.cy), dist(x2, y2, info.cx, info.cy)
+        local ok = type(x1) == "number" and close(x1, info.cx + info.r0 * math.cos(a), 1e-6) and close(y1, info.cy + info.r0 * math.sin(a), 1e-6)
+          and close(x2, info.cx + (info.r0 + info.len) * math.cos(a), 1e-6) and close(y2, info.cy + (info.r0 + info.len) * math.sin(a), 1e-6)
+        if not ok then bad[#bad + 1] = i .. " from " .. num(d1) .. " to " .. num(d2) end
+        if not (d1 and drawnEdge and close(d1, drawnEdge, 1e-6)) then past[#past + 1] = i .. " starts at " .. num(d1) .. ", not on the circle's edge" end
+        if not (d2 and d2 <= info.edge + 1e-9) then past[#past + 1] = i .. " reaches " .. num(d2) .. ", past " .. num(info.edge) end
+        if not (d1 and d2 and d2 - d1 >= math.min(4, info.full) - 1e-9) then past[#past + 1] = i .. " only " .. num(d2 and d1 and d2 - d1) .. " long" end
+      end
+    end
+    check(#bad == 0, when .. (info.ticks and ("the ticks on their axes from " .. num(info.r0) .. " out " .. num(info.len))
+      or ("the ticks hidden: only " .. num(info.len) .. " fits, under " .. num(math.min(4, info.full)))) .. " (not: " .. table.concat(bad, ", ") .. ")")
+    check(#past == 0, when .. "shown ticks start at the circle's drawn edge, stop by " .. num(info.edge) .. " (" .. (info.rim >= 2 and "1 inside the rim" or "1 inside the frame")
+      .. ") and are at least " .. num(math.min(4, info.full)) .. " long (not: " .. table.concat(past, ", ") .. ")")
+  end
+  -- A strip all the way round closes on itself: its last segment ends where its first starts.
+  local function closes(label, segs)
+    local a, z = segs and segs[1], segs and segs[#segs]
+    check(a ~= nil and same(z.c[3], a.c[1], 1e-9) and same(z.c[4], a.c[2], 1e-9),
+      label .. ": all the way round, the last segment ends exactly where the first starts (" .. cstr(z and z.c[3]) .. " and " .. cstr(a and a.c[1]) .. ")")
+  end
+  -- Two strips that meet: a's last segment ends exactly where b's first starts (or where b's last
+  -- ends: endToEnd).
+  local function meets(label, a, b, endToEnd)
+    local x = a and a[#a]
+    local y = b and (endToEnd and b[#b] or b[1])
+    local y1, y2 = y and (endToEnd and y.c[3] or y.c[1]), y and (endToEnd and y.c[4] or y.c[2])
+    check(x ~= nil and y ~= nil and same(x.c[3], y1, 1e-9) and same(x.c[4], y2, 1e-9), label .. " (" .. cstr(x and x.c[3]) .. " and " .. cstr(y1) .. ")")
+  end
+  -- Segments of design D made as Lines (or squares), other than the shot mark and the ticks.
+  local function lineSegs(r, D)
+    local out = {}
+    for name in pairs(r.segs) do
+      local k = name:sub(#D + 2)
+      if name:sub(1, #D + 1) == D .. ":" and k ~= "shot" and not k:find("^tick%d$") then out[#out + 1] = k end
+    end
+    table.sort(out)
+    return out
+  end
+
+  -- SetVertexOffset calls per seamless strip texture of design D, by key.
+  local function vcalls(r, D)
+    local out = {}
+    for name, t in pairs(r.tex) do
+      if name:sub(1, #D + 2) == D .. ":Q" then out[name:sub(#D + 2)] = rawget(t, "vertexOffsetCalls") or 0 end
+    end
+    return out
+  end
+  -- The textures of design D laid out while fn runs: key -> SetVertexOffset calls.
+  local function during(r, D, fn)
+    local before = vcalls(r, D)
+    fn()
+    local diff = {}
+    for k, v in pairs(vcalls(r, D)) do if v ~= (before[k] or 0) then diff[k] = v - (before[k] or 0) end end
+    return diff
+  end
+  -- Each segment a list of strips shows, with where it lies: key .. i -> its numbers.
+  local function segModel(list)
+    local m = {}
+    for _, g in ipairs(list) do
+      for i = 1, g.n do
+        local t0, t1 = math.max((i - 1) / g.n, g.from), math.min(i / g.n, g.to)
+        if t1 > t0 and g.alpha > 0 then
+          m[g.key .. i] = { g.cx, g.cy, g.rad + g.thick / 2, math.max(0, g.rad - g.thick / 2), g.a0, g.a1, t0, t1 }
+        end
+      end
+    end
+    return m
+  end
+  -- The segments shown in model b that were not shown in a or lie somewhere else (a nil: all of b).
+  local function moved(a, b)
+    local out = {}
+    for k, v in pairs(b) do
+      local o = a and a[k]
+      local unmoved = o ~= nil
+      if o then for j = 1, #v do if math.abs(v[j] - o[j]) > 1e-12 then unmoved = false end end end
+      if not unmoved then out[k] = true end
+    end
+    return out
+  end
+  -- What was laid out (diff, from during) against what should have been (want, from moved): each
+  -- of those once (its four corners), nothing else.
+  local function checkLaid(label, diff, want)
+    local missing, extra, wrong, n, w = {}, {}, {}, 0, 0
+    for k in pairs(want) do w = w + 1 if not diff[k] then missing[#missing + 1] = k end end
+    for k, c in pairs(diff) do
+      n = n + c
+      if not want[k] then extra[#extra + 1] = k elseif c ~= 4 then wrong[#wrong + 1] = k .. "=" .. c end
+    end
+    table.sort(missing) table.sort(extra) table.sort(wrong)
+    check(#missing == 0 and #extra == 0 and #wrong == 0 and n == 4 * w, label .. ": " .. w .. " segments laid out, four corners each (" .. n
+      .. " SetVertexOffset calls; not laid out: " .. table.concat(missing, " ") .. "; laid out though unmoved: " .. table.concat(extra, " ")
+      .. "; calls: " .. table.concat(wrong, " ") .. ")")
+  end
+`;
+
+scenario('stubs: Texture:SetVertexOffset takes vertex 1 to 4 and numbers only; T.quadCorners adds each offset to its corner of the box; T.noVertexOffset takes the method away', String.raw`
+  local f = CreateFrame("Frame", nil, UIParent)
+  local t = f:CreateTexture()
+  for _, bad in ipairs({ 0, 5, 1.5, "1" }) do
+    check(not pcall(t.SetVertexOffset, t, bad, 0, 0), "vertex " .. tostring(bad) .. " refused")
+  end
+  check(not pcall(t.SetVertexOffset, t, 1, "x", 0) and not pcall(t.SetVertexOffset, t, 1, 0, nil) and not pcall(t.SetVertexOffset, t, 1, 0 / 0, 0),
+    "offsets must be numbers")
+  t:SetSize(2, 2) t:SetPoint("CENTER", f, "BOTTOMLEFT", 10, 20)
+  t:SetVertexOffset(1, -3, 4) t:SetVertexOffset(4, 5, -6)
+  local c = T.quadCorners(t)
+  check(c[1][1] == 6 and c[1][2] == 25 and c[2][1] == 9 and c[2][2] == 19 and c[3][1] == 11 and c[3][2] == 21 and c[4][1] == 16 and c[4][2] == 13,
+    "the corners: upper left moved, lower left and upper right where the box puts them, lower right moved")
+  check(rawget(t, "vertexOffsetCalls") == 2 and T.vertexOffsetCalls == 2, "calls counted per texture and in all")
+  t:Hide()
+  check(T.quadCorners(t) == nil, "hidden: no corners")
+  T.noVertexOffset = true
+  check(f:CreateTexture().SetVertexOffset == nil, "T.noVertexOffset: no SetVertexOffset")
+`);
+
+scenario('Seamless strips (Blizzard art): the arc, the ring and the reticle through a fight: corners on their circles, neighbors share corners, each strip covers exactly its part, the art\'s u follows the path, no overlap', DISPLAY_HELPERS + QUAD_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  check(NS.Styles.Applied() == nil and db.dispThick == 12 and db.artFlip == false, "the Blizzard style, lines 12 thick, the art the right way up")
+  local zf = 0.5 / 2.8
+  local clippedSeen = 0
+  local function artAll(r, D, when, st)
+    check(r.mode == "art", when .. "drawn in the bar's art (" .. tostring(r.mode) .. ")")
+    local list, by, info = quadStrips(D, "art", r.w, r.h, db, st, quadLook(db))
+    local segs = checkAll(when, r, list, db.artFlip)
+    clippedSeen = clippedSeen + clippedCount(segs)
+    local extra = lineSegs(r, D)
+    check(#extra == 0, when .. "no Line strips made (" .. table.concat(extra, ", ") .. ")")
+    if D == "reticle" then
+      checkTicks(when, r, info, "QAcirc")
+    else
+      -- The zone's clipped pieces lie on the background's outline, the tint's on the fill's.
+      onOutline(when .. "the zone lies on the background's outline", segs.QAzone, segs.QAbg)
+      if st.lit then
+        for _, k in ipairs(D == "arc" and { { "QAtl", "QAfl" }, { "QAtr", "QAfr" } } or { { "QAtint", "QAfill" } }) do
+          onOutline(when .. k[1] .. " lies on " .. k[2] .. "'s outline", segs[k[1]], segs[k[2]])
+        end
+      end
+    end
+    return segs, by, info
+  end
+  for index, D in ipairs({ "arc", "ring", "reticle" }) do
+    local tag = "[" .. D .. "] "
+    local errs = #T.errors
+    T.slash("display " .. D)
+    local r = T.rend()
+    check(r.quads == true, tag .. "the renderer found SetVertexOffset")
+    local base = 100 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    for _, t in ipairs({ 0.9, 1.7, 2.55 }) do
+      T.now = base + t T.update()
+      local p = t / 2.8
+      local segs, by = artAll(r, D, tag .. "p " .. num(p) .. (t > 2.3 and " (in the zone)" or "") .. ": ", { p = p, lit = t > 2.3 })
+      if D ~= "reticle" then
+        local z = segs.QAzone
+        local z0, z1 = 1 - zf, 1
+        if D == "arc" then z0, z1 = 0.5 - 0.5 * zf, 0.5 + 0.5 * zf end
+        check(z and #z > 0 and close(z[1].f0, z0, 1e-6) and close(z[#z].f1, z1, 1e-6), tag .. "p " .. num(p) .. ": the zone covers " .. (D == "arc" and "the middle " or "the last ")
+          .. num(zf) .. " of the path (" .. num(z and z[1] and z[1].f0) .. " to " .. num(z and z[#z] and z[#z].f1) .. ")")
+        for _, k in ipairs(D == "arc" and { "QAfl", "QAfr" } or { "QAfill" }) do
+          local s = segs[k]
+          check(s and #s > 0 and close(s[1].f0, 0, 1e-6) and close(s[#s].f1, p, 1e-6), tag .. "p " .. num(p) .. ": " .. k .. " ends exactly at p (" .. num(s and s[#s] and s[#s].f1) .. ")")
+        end
+      end
+    end
+    T.now = base + 2.6 T.fire("PLAYER_STARTED_MOVING") T.update()
+    artAll(r, D, tag .. "moving in the zone: ", { p = 2.6 / 2.8, lit = true, clipping = true })
+    T.now = base + 2.7 T.fire("PLAYER_STOPPED_MOVING") T.update()
+    artAll(r, D, tag .. "standing in the zone: ", { p = 2.7 / 2.8, lit = true })
+    local waitAt = base + 2.81
+    T.now = waitAt T.update()
+    check(T.stateHas("waiting for a late shot"), tag .. "holding for the shot")
+    for _, t in ipairs({ 3.0, 3.25 }) do
+      T.now = base + t T.update()
+      local pulse = pulseAt(T.now - waitAt)
+      local when = tag .. "holding (pulse " .. num(pulse) .. "): "
+      local segs = artAll(r, D, when, { p = 1, lit = true, pulse = pulse })
+      if D == "arc" then
+        meets(when .. "the two fills meet exactly at the top", segs.QAfl, segs.QAfr, true)
+        local e = segs.QAfl and segs.QAfl[#segs.QAfl]
+        check(e and close(e.c[3][1], r.w / 2, 1e-9) and e.c[3][2] > r.h * NS.ARC_CY, when .. "and the top is straight above the center")
+      elseif D == "ring" then
+        for _, k in ipairs({ "QAbg", "QAfill", "QAtint", "QAframe" }) do closes(when .. k, segs[k]) end
+      else
+        for _, k in ipairs({ "QArim", "QAcirc", "QAtint", "Qz" }) do closes(when .. k, segs[k]) end
+      end
+    end
+    T.now = base + 3.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+    artAll(r, D, tag .. "the late shot fires: ", { p = 0, lit = false })
+    T.now = base + 3.9 T.update()
+    artAll(r, D, tag .. "the next swing: ", { p = 0.5 / 2.8, lit = false })
+    -- The marks over the strips: the shot mark above the frame, the reticle's ticks above its circle.
+    local maxSub = -99
+    for name, t in pairs(r.tex) do
+      if name:sub(1, #D + 2) == D .. ":Q" then maxSub = math.max(maxSub, rawget(t, "sublevel") or 0) end
+    end
+    if D == "reticle" then
+      local bad = {}
+      for i = 1, 4 do
+        local tick = T.part(r, "tick" .. i)
+        if not (tick and rawget(tick, "kind") == "Line" and rawget(tick, "layer") == "ARTWORK" and rawget(tick, "sublevel") == 5) then
+          bad[#bad + 1] = i .. "=" .. tostring(tick and rawget(tick, "kind")) .. " " .. tostring(tick and rawget(tick, "sublevel"))
+        end
+      end
+      check(#bad == 0 and maxSub < 5, tag .. "the ticks are Lines at ARTWORK 5, above every strip (strips up to " .. maxSub .. "; not: " .. table.concat(bad, ", ") .. ")")
+      -- The zone ring over the circle (2) and its tint (3), under the ticks.
+      local zs, cs, ts = {}, {}, {}
+      for i = 1, 32 do
+        zs[rawget(T.part(r, "Qz" .. i) or {}, "sublevel") or "none"] = true
+        cs[rawget(T.part(r, "QAcirc" .. i) or {}, "sublevel") or "none"] = true
+        ts[rawget(T.part(r, "QAtint" .. i) or {}, "sublevel") or "none"] = true
+      end
+      local function only(set, v) local n = 0 for _ in pairs(set) do n = n + 1 end return n == 1 and set[v] == true end
+      check(only(zs, 4) and only(cs, 2) and only(ts, 3), tag .. "the zone ring at ARTWORK 4, over the circle at 2 and its tint at 3, under the ticks at 5")
+    else
+      local shot, frame1 = T.part(r, "shot"), T.part(r, "QAframe1")
+      check(shot and rawget(shot, "kind") == "Line" and rawget(shot, "layer") == "ARTWORK" and rawget(shot, "sublevel") == 6 and T.isShown(shot)
+        and frame1 and rawget(frame1, "sublevel") == 4 and maxSub == 4,
+        tag .. "the shot mark a Line at ARTWORK 6, above the frame strip at 4 (" .. tostring(shot and rawget(shot, "sublevel")) .. " over " .. tostring(frame1 and rawget(frame1, "sublevel")) .. ", strips up to " .. maxSub .. ")")
+    end
+    check(T.debugSays("display: " .. NS.DISPLAY_NAMES[D] .. ", locked, shown, lines, Blizzard art, seamless strips"), tag .. "debug: Blizzard art, seamless strips")
+    check(#T.errors == errs, tag .. "no Lua errors (" .. (#T.errors - errs) .. ")")
+  end
+  check(clippedSeen > 20, "pieces clipped by from/to were among those checked (" .. clippedSeen .. ")")
+
+  -- /shotwindow flipart: every art strip's top and bottom swap, and back.
+  for index, D in ipairs({ "arc", "ring", "reticle" }) do
+    T.slash("display " .. D)
+    local r = T.rend()
+    local base = 200 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    T.now = base + 0.9 T.update()
+    T.slash("flipart")
+    check(db.artFlip == true, "[" .. D .. "] flipped")
+    T.now = base + 1.0 T.update()
+    artAll(r, D, "[" .. D .. "] flipped: ", { p = 1.0 / 2.8 })
+    T.slash("flipart")
+    T.now = base + 1.1 T.update()
+    artAll(r, D, "[" .. D .. "] flipped back: ", { p = 1.1 / 2.8 })
+  end
+  -- The preview: a slash command does not resize it, so nothing is laid out again; the flip swaps
+  -- the texcoords of strips that stay where they are.
+  T.slash("display ring")
+  T.slash("")
+  T.click(T.tab(2))
+  local pr = T.preview(T.pages()[2]).renderer
+  T.now = 300 T.update() T.now = 300.1 T.update()
+  local function previewStatic(label)
+    check(pr.design == "ring" and pr.mode == "art" and pr.quads == true, "[ring] preview " .. label .. ": in the bar's art, seamless strips")
+    local _, by = quadStrips("ring", "art", pr.w, pr.h, db, { p = 0 }, quadLook(db))
+    for _, k in ipairs({ "QAbg", "QAframe" }) do closes("[ring] preview " .. label .. ": " .. k, checkQuads("[ring] preview " .. label .. ": ", pr, by[k], db.artFlip)) end
+  end
+  local function staticCalls()
+    local n = 0
+    for k, c in pairs(vcalls(pr, "ring")) do if k:find("^QAbg") or k:find("^QAframe") then n = n + c end end
+    return n
+  end
+  previewStatic("the right way up")
+  local n0 = staticCalls()
+  T.slash("flipart") T.now = 300.2 T.update()
+  previewStatic("flipped")
+  check(staticCalls() == n0, "[ring] preview flipped: the background and frame not laid out again, only their texcoords swapped (" .. (staticCalls() - n0) .. " SetVertexOffset calls)")
+  T.slash("flipart") T.now = 300.3 T.update()
+  previewStatic("flipped back")
+  snapOnce("[ring] preview: ", pr, "ring")
+  local nTex, nSnap, nBias = snapTotals()
+  check(nTex > 0 and nSnap == nTex and nBias == nTex, "the display and the preview: each strip texture's snapping turned off once, never again ("
+    .. nTex .. " textures, " .. nSnap .. " SetSnapToPixelGrid and " .. nBias .. " SetTexelSnappingBias calls)")
+  check(#T.errors == 0, "no errors")
+`);
+
+for (const [flat, label] of [['dark', 'the Dark style'], ['missing', 'no atlas info']]) {
+  scenario('Seamless strips, flat (' + label + '): the arc, the ring and the reticle through a fight: corners on their circles, neighbors share corners, track and zone meet without overlap, the colors follow the clock', DISPLAY_HELPERS + QUAD_HELPERS + 'local FLAT = "' + flat + '"\n' + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  if FLAT == "dark" then ShotWindowDB = { style = "dark" } else T.atlasMode = "missing" end
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  local db = ShotWindowDB
+  check(FLAT ~= "dark" or NS.Styles.Applied() == "dark", "Dark drawn")
+  local why = FLAT == "dark" and "flat (a drawn window style)" or "flat (no atlas info)"
+  local function flatAll(r, D, when, st)
+    check(r.mode == "flat", when .. "drawn flat (" .. tostring(r.mode) .. ")")
+    local list, by, info = quadStrips(D, "flat", r.w, r.h, db, st, quadLook(db))
+    local segs = checkAll(when, r, list, false)
+    local extra = lineSegs(r, D)
+    check(#extra == 0, when .. "no Line strips made (" .. table.concat(extra, ", ") .. ")")
+    local art = 0
+    for name, t in pairs(r.tex) do if name:sub(1, #D + 3) == D .. ":QA" and T.isShown(t) then art = art + 1 end end
+    check(art == 0, when .. "no art strips shown (" .. art .. ")")
+    if D == "arc" then
+      meets(when .. "the left track ends exactly where its zone starts", segs.Qtlt, segs.Qtlz)
+      meets(when .. "the right track ends exactly where its zone starts", segs.Qtrt, segs.Qtrz)
+      meets(when .. "the two zones meet exactly at the top", segs.Qtlz, segs.Qtrz, true)
+    elseif D == "ring" then
+      meets(when .. "the track ends exactly where the zone starts", segs.Qtt, segs.Qtz)
+      meets(when .. "the zone ends exactly where the track starts, all the way round", segs.Qtz, segs.Qtt)
+    else
+      closes(when .. "Qz", segs.Qz)
+      closes(when .. "Qc", segs.Qc)
+      checkTicks(when, r, info, "Qc")
+      local z1, c1 = T.part(r, "Qz1"), T.part(r, "Qc1")
+      check(z1 and c1 and rawget(z1, "sublevel") == 4 and rawget(c1, "sublevel") == 2, when .. "the zone ring at ARTWORK 4, over the circle at 2 ("
+        .. tostring(z1 and rawget(z1, "sublevel")) .. " over " .. tostring(c1 and rawget(c1, "sublevel")) .. ")")
+    end
+    return segs
+  end
+  for index, D in ipairs({ "arc", "ring", "reticle" }) do
+    local tag = "[" .. D .. "] "
+    local errs = #T.errors
+    T.slash("display " .. D)
+    local r = T.rend()
+    check(r.quads == true, tag .. "the renderer found SetVertexOffset")
+    local base = 100 + index * 20
+    T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+    for _, t in ipairs({ 0.9, 1.7, 2.55 }) do
+      T.now = base + t T.update()
+      local p = t / 2.8
+      local segs = flatAll(r, D, tag .. "p " .. num(p) .. (t > 2.3 and " (in the zone)" or "") .. ": ", { p = p, lit = t > 2.3 })
+      for _, k in ipairs(D == "arc" and { "Qfl", "Qfr" } or (D == "ring" and { "Qf" } or {})) do
+        local s = segs[k]
+        check(s and #s > 0 and close(s[1].f0, 0, 1e-6) and close(s[#s].f1, p, 1e-6), tag .. "p " .. num(p) .. ": " .. k .. " ends exactly at p (" .. num(s and s[#s] and s[#s].f1) .. ")")
+      end
+    end
+    T.now = base + 2.6 T.fire("PLAYER_STARTED_MOVING") T.update()
+    flatAll(r, D, tag .. "moving in the zone: ", { p = 2.6 / 2.8, lit = true, clipping = true })
+    T.now = base + 2.7 T.fire("PLAYER_STOPPED_MOVING") T.update()
+    flatAll(r, D, tag .. "standing in the zone: ", { p = 2.7 / 2.8, lit = true })
+    local waitAt = base + 2.81
+    T.now = waitAt T.update()
+    for _, t in ipairs({ 3.0, 3.25 }) do
+      T.now = base + t T.update()
+      local pulse = pulseAt(T.now - waitAt)
+      local when = tag .. "holding (pulse " .. num(pulse) .. "): "
+      local segs = flatAll(r, D, when, { p = 1, lit = true, pulse = pulse })
+      if D == "arc" then meets(when .. "the two fills meet exactly at the top", segs.Qfl, segs.Qfr, true) end
+      if D == "ring" then closes(when .. "Qf", segs.Qf) end
+    end
+    T.now = base + 3.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+    flatAll(r, D, tag .. "the late shot fires: ", { p = 0, lit = false })
+    T.now = base + 3.9 T.update()
+    flatAll(r, D, tag .. "the next swing: ", { p = 0.5 / 2.8, lit = false })
+    local maxSub = -99
+    for name, t in pairs(r.tex) do
+      if name:sub(1, #D + 2) == D .. ":Q" then maxSub = math.max(maxSub, rawget(t, "sublevel") or 0) end
+    end
+    if D ~= "reticle" then
+      local shot = T.part(r, "shot")
+      check(shot and rawget(shot, "kind") == "Line" and rawget(shot, "sublevel") == 6 and maxSub < 6,
+        tag .. "the shot mark a Line at ARTWORK 6, above every strip (" .. tostring(shot and rawget(shot, "sublevel")) .. ", strips up to " .. maxSub .. ")")
+    end
+    check(T.debugSays("display: " .. NS.DISPLAY_NAMES[D] .. ", locked, shown, lines, " .. why .. ", seamless strips"), tag .. "debug: " .. why .. ", seamless strips")
+    check(#T.errors == errs, tag .. "no Lua errors (" .. (#T.errors - errs) .. ")")
+  end
+  check(#T.errors == 0, "no errors")
+`);
+}
+
+for (const D of ['arc', 'ring', 'reticle']) {
+  scenario('Seamless strips (' + D + '): a segment is laid out again only when its place changes; everything again, and shown, after HideParts, a resize, another design, another style, no swing', DISPLAY_HELPERS + QUAD_HELPERS + 'local D = "' + D + '"\n' + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = D }
+  T.login(200)
+  local db = ShotWindowDB
+  local r = T.rend()
+  local tag = "[" .. D .. "] "
+  local function model(mode, st) return segModel((quadStrips(D, mode, r.w, r.h, db, st, quadLook(db)))) end
+  local function drawnAs(label, mode, st)
+    check(r.mode == mode, tag .. label .. ": drawn " .. mode .. " (" .. tostring(r.mode) .. ")")
+    checkAll(tag .. label .. ": ", r, (quadStrips(D, mode, r.w, r.h, db, st, quadLook(db))), db.artFlip)
+  end
+  T.update()
+  check(r.quads == true and r.mode == "art", tag .. "seamless strips in the bar's art (" .. tostring(r.quads) .. ", " .. tostring(r.mode) .. ")")
+  local n0 = T.vertexOffsetCalls or 0
+  check(n0 > 0, tag .. "laid out at login (" .. n0 .. " SetVertexOffset calls)")
+  local nTex = snapOnce(tag .. "at login: ", r, D)
+  local s0, b0 = T.snapCalls or 0, T.texelBiasCalls or 0
+  check(s0 == nTex and b0 == nTex, tag .. "at login: one SetSnapToPixelGrid and one SetTexelSnappingBias per strip texture (" .. s0 .. " and " .. b0 .. " for " .. nTex .. ")")
+  for k = 1, 5 do T.now = T.now + 0.1 T.update() end
+  check((T.vertexOffsetCalls or 0) == n0, tag .. "idle frames, nothing moved: no SetVertexOffset (" .. ((T.vertexOffsetCalls or 0) - n0) .. ")")
+  check((T.snapCalls or 0) == s0 and (T.texelBiasCalls or 0) == b0, tag .. "idle frames: pixel snapping not set again (" .. ((T.snapCalls or 0) - s0) .. " and "
+    .. ((T.texelBiasCalls or 0) - b0) .. " more calls)")
+
+  -- A moving fill: only the segments whose part changed (and the reticle's circle, which shrinks).
+  local B = 110 -- the swing starts here; the late shot comes at B + 3.4
+  local function at(t) T.now = B + t T.update() end
+  T.now = B T.fire("PLAYER_SWING", 2.8, 2)
+  at(1)
+  local a = model("art", { p = 1 / 2.8 })
+  local diff = during(r, D, function() at(1.02) end)
+  local b = model("art", { p = 1.02 / 2.8 })
+  checkLaid(tag .. "the fill moves a little", diff, moved(a, b))
+  diff = during(r, D, function() at(1.5) end)
+  local c = model("art", { p = 1.5 / 2.8 })
+  checkLaid(tag .. "the fill moves on", diff, moved(b, c))
+  drawnAs("the fill moving", "art", { p = 1.5 / 2.8 })
+
+  -- Holding for the shot: the pulse changes alphas only; nothing is laid out again.
+  at(2.81)
+  at(3.0)
+  diff = during(r, D, function() at(3.1) end)
+  checkLaid(tag .. "holding, the pulse changes only alphas", diff, {})
+  drawnAs("holding", "art", { p = 1, lit = true, pulse = pulseAt(3.1 - 2.81) })
+
+  -- The late shot, then everything hidden and laid out again.
+  T.now = B + 3.4 T.fire("PLAYER_SWING", 2.8, 2) T.update()
+  r:HideParts()
+  check(T.shownParts(r) == 0, tag .. "HideParts: nothing shown (" .. T.shownParts(r) .. ")")
+  diff = during(r, D, function() at(3.6) end)
+  checkLaid(tag .. "after HideParts", diff, moved(nil, model("art", { p = 0.2 / 2.8 })))
+  drawnAs("after HideParts", "art", { p = 0.2 / 2.8 })
+
+  r:SetSize(r.w, r.h)
+  diff = during(r, D, function() at(3.7) end)
+  checkLaid(tag .. "after SetSize to the same size", diff, moved(nil, model("art", { p = 0.3 / 2.8 })))
+  drawnAs("after SetSize to the same size", "art", { p = 0.3 / 2.8 })
+
+  db.dispSize = 180
+  T.slash("display " .. D)
+  diff = during(r, D, function() at(3.8) end)
+  check(r.w == 180, tag .. "resized to 180 (" .. tostring(r.w) .. ")")
+  checkLaid(tag .. "resized", diff, moved(nil, model("art", { p = 0.4 / 2.8 })))
+  drawnAs("resized", "art", { p = 0.4 / 2.8 })
+
+  T.slash("display classic") at(3.9)
+  check(r.design == "classic" and T.shownParts(r, D) == 0, tag .. "another design: nothing of " .. D .. " shown (" .. T.shownParts(r, D) .. ")")
+  T.slash("display " .. D)
+  diff = during(r, D, function() at(4.0) end)
+  checkLaid(tag .. "back from another design", diff, moved(nil, model("art", { p = 0.6 / 2.8 })))
+  drawnAs("back from another design", "art", { p = 0.6 / 2.8 })
+  T.slash("display classic") T.slash("display " .. D)
+  diff = during(r, D, function() at(4.1) end)
+  checkLaid(tag .. "away and back with no frame drawn between", diff, moved(nil, model("art", { p = 0.7 / 2.8 })))
+  drawnAs("away and back with no frame drawn between", "art", { p = 0.7 / 2.8 })
+
+  -- No swing duration: Auto Shot off and the swing over (drawn idle, shown out of combat too),
+  -- then the bow taken off, then put back, then a swing.
+  T.autoRep[75] = false
+  T.fire("STOP_AUTOREPEAT_SPELL")
+  db.dispAlways = true
+  at(6.3)
+  check(T.stateHas("idle"), tag .. "the swing over, Auto Shot off: idle")
+  drawnAs("idle", "art", { p = 0, idle = true })
+  T.speed.rng = nil
+  T.fire("PLAYER_EQUIPMENT_CHANGED", 18, true) at(6.4)
+  check(T.shownParts(r) == 0, tag .. "no ranged weapon: nothing shown (" .. T.shownParts(r) .. ")")
+  T.speed.rng = 2.8
+  T.fire("PLAYER_EQUIPMENT_CHANGED", 18, false)
+  diff = during(r, D, function() at(6.5) end)
+  checkLaid(tag .. "a bow again", diff, moved(nil, model("art", { p = 0, idle = true })))
+  drawnAs("a bow again", "art", { p = 0, idle = true })
+  a = model("art", { p = 0, idle = true })
+  T.now = B + 7 T.fire("PLAYER_SWING", 2.8, 2)
+  diff = during(r, D, function() at(7.1) end)
+  checkLaid(tag .. "a bow again, then a swing", diff, moved(a, model("art", { p = 0.1 / 2.8 })))
+  drawnAs("a bow again, then a swing", "art", { p = 0.1 / 2.8 })
+
+  -- Another style: drawn flat (only a /reload takes it back to the art).
+  T.slash("style dark")
+  diff = during(r, D, function() at(7.2) end)
+  checkLaid(tag .. "the Dark style", diff, moved(nil, model("flat", { p = 0.2 / 2.8 })))
+  drawnAs("the Dark style", "flat", { p = 0.2 / 2.8 })
+  local art = 0
+  for name, t in pairs(r.tex) do if name:sub(1, #D + 3) == D .. ":QA" and T.isShown(t) then art = art + 1 end end
+  check(art == 0, tag .. "the Dark style: no art strip shown (" .. art .. ")")
+  a = model("flat", { p = 0.2 / 2.8 })
+  diff = during(r, D, function() at(7.25) end)
+  checkLaid(tag .. "the Dark style, the fill moves", diff, moved(a, model("flat", { p = 0.25 / 2.8 })))
+  -- After all of that (HideParts, resizes, designs, styles, no swing): still once per texture.
+  snapOnce(tag .. "at the end: ", r, nil)
+  local tTex, tSnap, tBias = snapTotals()
+  check(tSnap == tTex and tBias == tTex, tag .. "at the end: pixel snapping set once per strip texture, never again (" .. tSnap .. " and " .. tBias
+    .. " calls for " .. tTex .. " textures)")
+  check(#T.errors == 0, "no errors")
+`);
+}
+
+// A client without SetSnapToPixelGrid / SetTexelSnappingBias: the strips are drawn all the same.
+scenario('Seamless strips without pixel snapping methods: the ring is still drawn in seamless strips, without errors', DISPLAY_HELPERS + QUAD_HELPERS + String.raw`
+  T.noPixelSnap = true
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "ring" }
+  T.login(200)
+  local db = ShotWindowDB
+  local r = T.rend()
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  check(r.quads == true and r.mode == "art", "seamless strips in the bar's art (" .. tostring(r.quads) .. ", " .. tostring(r.mode) .. ")")
+  local segs = checkAll("[ring] ", r, (quadStrips("ring", "art", r.w, r.h, db, { p = 1 / 2.8 }, quadLook(db))), db.artFlip)
+  check(#(segs.QAfill or {}) > 0 and T.snapCalls == nil and T.texelBiasCalls == nil, "drawn, and no snapping calls made (" .. tostring(T.snapCalls) .. ")")
+  check(#T.errors == 0, "no errors (" .. tostring(T.errors[1]) .. ")")
+`);
+
+scenario('Seamless strips (reticle) at the slider extremes: the rim hidden when it does not fit, the circle tightens and stays a ring, the ticks start at its drawn edge, stop short of the rim and hide when too short',DISPLAY_HELPERS + QUAD_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { display = "reticle" }
+  T.login(200)
+  local db = ShotWindowDB
+  local r = T.rend()
+  local base = 100
+  local ticksSeen, hiddenSeen = {}, {}
+  for _, mode in ipairs({ "art", "flat" }) do
+    if mode == "flat" then T.slash("style dark") end
+    for _, ext in ipairs({ { 60, 2 }, { 60, 30 }, { 400, 2 }, { 400, 30 }, { 140, 12 } }) do
+      db.dispSize, db.dispThick = ext[1], ext[2]
+      T.slash("display reticle")
+      local tag = "[" .. mode .. ", size " .. ext[1] .. ", line " .. ext[2] .. "] "
+      base = base + 10
+      T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+      local prev, rimSeen
+      local circ = mode == "art" and "QAcirc" or "Qc"
+      for _, t in ipairs({ 0.14, 0.84, 1.68, 2.52, 2.81, 3.0 }) do
+        T.now = base + t T.update()
+        local hold = t > 2.8
+        local p = hold and 1 or t / 2.8
+        local st = { p = p, lit = t > 2.3 }
+        if t == 3.0 then st.pulse = pulseAt(3.0 - 2.81) end
+        local when = tag .. (hold and "holding" or ("p " .. num(p))) .. ": "
+        check(r.mode == mode, when .. "drawn " .. mode .. " (" .. tostring(r.mode) .. ")")
+        local list, by, info = quadStrips("reticle", mode, r.w, r.h, db, st, quadLook(db))
+        local segs = checkAll(when, r, list, db.artFlip)
+        -- The circle's radius from its corners: halfway between its outer and inner circle.
+        local c = T.quadCorners(T.part(r, circ .. "1"))
+        local ro = type(c) == "table" and dist(c[1][1], c[1][2], r.w / 2, r.h / 2)
+        local ri = type(c) == "table" and dist(c[2][1], c[2][2], r.w / 2, r.h / 2)
+        local rad = ro and (ro + ri) / 2
+        if t ~= 3.0 then -- the second tick of the hold stays where the first left it
+          check(rad and (prev == nil or rad < prev - 1e-9), when .. "the circle tightens (radius " .. num(rad) .. " after " .. num(prev) .. ")")
+        end
+        check(rad and ri >= 0.6 * rad - 1e-9, when .. "and stays a ring (inner radius " .. num(ri) .. " of " .. num(rad) .. ")")
+        if hold then check(close(rad, info.rmin, 1e-6), when .. "closed to its smallest (" .. num(rad) .. ", want " .. num(info.rmin) .. ")") end
+        prev = rad
+        local rimShown = 0
+        for i = 1, 40 do if T.isShown(T.part(r, "QArim" .. i)) then rimShown = rimShown + 1 end end
+        if mode == "art" then
+          check(rimShown == (info.rim >= 2 and 40 or 0), when .. "the rim " .. (info.rim >= 2 and "shown" or "hidden, it does not fit") .. " (" .. num(info.rim) .. " wide, " .. rimShown .. " segments shown)")
+          if ext[1] == 60 and ext[2] == 30 then check(rimShown == 0, when .. "size 60, line 30: no rim") end
+          if info.rim >= 2 then
+            local edge = info.rimR - info.rim / 2
+            check(ro and ro <= edge + 1e-9, when .. "the circle stays inside the rim (" .. num(ro) .. ", rim from " .. num(edge) .. ")")
+          end
+        else
+          check(rimShown == 0, when .. "no rim when drawn flat (" .. rimShown .. ")")
+        end
+        rimSeen = rimSeen or rimShown > 0
+        -- The ticks: Lines at ARTWORK 5 from the circle's drawn edge, never across the rim (art,
+        -- the rim shown) or past half - 1, hidden rather than too short to read.
+        checkTicks(when, r, info, circ)
+        local far = 0
+        for i = 1, 4 do
+          local tick = T.part(r, "tick" .. i)
+          if T.isShown(tick) then
+            local x1, y1, x2, y2 = T.segEnds(tick)
+            far = math.max(far, dist(x1, y1, r.w / 2, r.h / 2) or 1e9, dist(x2, y2, r.w / 2, r.h / 2) or 1e9)
+            ticksSeen[mode] = (ticksSeen[mode] or 0) + 1
+          else
+            hiddenSeen[mode] = (hiddenSeen[mode] or 0) + 1
+          end
+        end
+        local limit = rimShown > 0 and (info.rimR - info.rim / 2 - 1) or (info.half - 1)
+        check(far <= limit + 1e-9, when .. "no tick past " .. num(limit) .. (rimShown > 0 and " (1 inside the rim)" or " (1 inside the frame)") .. " (" .. num(far) .. ")")
+      end
+    end
+    check((ticksSeen[mode] or 0) > 0 and (hiddenSeen[mode] or 0) > 0, "[" .. mode .. "] the ticks both shown and hidden across the extremes ("
+      .. tostring(ticksSeen[mode]) .. " shown, " .. tostring(hiddenSeen[mode]) .. " hidden)")
+  end
+  check(#T.errors == 0, "no errors")
+`);
+
+// The debug line names the strips and the reason a round design is flat. Each case is a client of
+// its own (Line regions, vertex offsets, atlas info) or a style, set before the renderer is made.
+for (const [label, setup, says, quads, mode] of [
+  ['Line regions and vertex offsets', '', 'lines, Blizzard art, seamless strips', true, 'art'],
+  ['no vertex offsets', 'T.noVertexOffset = true', 'lines, Blizzard art, line strips', false, 'art'],
+  ['no CreateLine, vertex offsets', 'T.noLines = true', 'squares, Blizzard art, seamless strips', true, 'art'],
+  ['neither Lines nor vertex offsets', 'T.noLines = true T.noVertexOffset = true', 'squares, flat (no way to bend the art), line strips', false, 'flat'],
+  ['the Dark style', 'ShotWindowDB = { style = "dark" }', 'lines, flat (a drawn window style), seamless strips', true, 'flat'],
+  ['the Dark style, neither Lines nor vertex offsets', 'ShotWindowDB = { style = "dark" } T.noLines = true T.noVertexOffset = true', 'squares, flat (a drawn window style), line strips', false, 'flat'],
+  ['no atlas info', 'T.atlasMode = "missing"', 'lines, flat (no atlas info), seamless strips', true, 'flat'],
+  ['no atlas info, neither Lines nor vertex offsets', 'T.atlasMode = "missing" T.noLines = true T.noVertexOffset = true', 'squares, flat (no way to bend the art), line strips', false, 'flat'],
+  ['the atlas file as info.filename', 'T.atlasMode = "filename"', 'lines, Blizzard art, seamless strips', true, 'art'],
+]) {
+  scenario('Seamless strips: the debug line (' + label + '): ' + says, DISPLAY_HELPERS + setup + '\nlocal SAYS, QUADS, MODE = "' + says + '", ' + quads + ', "' + mode + '"\n' + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = ShotWindowDB or {}
+  ShotWindowDB.display = "ring"
+  T.login(200)
+  T.fire("PLAYER_ENTERING_WORLD")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2) T.now = 101 T.update()
+  local r = T.rend()
+  check(r.quads == QUADS, "vertex offsets " .. (QUADS and "found" or "not there") .. " (" .. tostring(r.quads) .. ")")
+  check(r.mode == MODE, "drawn " .. MODE .. " (" .. tostring(r.mode) .. ")")
+  local n = #T.prints
+  T.slash("debug")
+  local line
+  for i = n + 1, #T.prints do if T.prints[i]:find("display: ", 1, true) then line = T.prints[i] end end
+  local want = "display: Ring, locked, shown, " .. SAYS .. ", alerts: "
+  check(line ~= nil and line:find(want, 1, true) ~= nil, "the debug line says " .. SAYS .. " (" .. tostring(line) .. ")")
+  -- Drawn the way it says: textures with moved corners, or segments.
+  local quadsShown = 0
+  for name, t in pairs(r.tex) do if name:sub(1, 6) == "ring:Q" and T.isShown(t) then quadsShown = quadsShown + 1 end end
+  check((quadsShown > 0) == QUADS, "seamless strip textures shown: " .. quadsShown)
+  if QUADS and MODE == "art" then
+    local bg = T.part(r, "QAbg1")
+    check(bg and rawget(bg, "file") == T.atlasFile, "the art from the atlas file (" .. tostring(bg and rawget(bg, "file")) .. ")")
+  end
+  check(#T.errors == 0, "no errors")
+`);
+}
+
+// The round designs at the slider extremes (size 60 to 400, line 2 to 30): a design is only
+// usable if its curve stays on its own side of the center, so the fill starts where its path does
+// and the shot mark stays above the center.
+scenario('Seamless strips at the slider extremes: the arc, the ring and the reticle stay bands round their center, start their fill where the path starts and keep the shot mark above the center, art and flat', DISPLAY_HELPERS + QUAD_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  local base = 100
+  -- Where each design's first fill segment starts (the angle about its center) and its key.
+  local START = {
+    arc = { art = { "QAfl", TOP + math.rad(110) }, flat = { "Qfl", TOP + math.rad(110) } },
+    ring = { art = { "QAfill", TOP }, flat = { "Qf", TOP } },
+    reticle = { art = { "QAcirc", TOP }, flat = { "Qc", 0 } },
+  }
+  for _, mode in ipairs({ "art", "flat" }) do
+    if mode == "flat" then T.slash("style dark") end
+    for _, D in ipairs({ "arc", "ring", "reticle" }) do
+      for _, ext in ipairs({ { 60, 2 }, { 60, 30 }, { 400, 2 }, { 400, 30 } }) do
+        db.dispSize, db.dispThick = ext[1], ext[2]
+        T.slash("display " .. D)
+        local r = T.rend()
+        local tag = "[" .. D .. ", " .. mode .. ", size " .. ext[1] .. ", line " .. ext[2] .. "] "
+        base = base + 10
+        T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+        -- Mid-swing, the whole model: every piece where it belongs, the clipped ones on their chords.
+        T.now = base + 1.0 T.update()
+        local list, _, info = quadStrips(D, mode, r.w, r.h, db, { p = 1.0 / 2.8 }, quadLook(db))
+        checkAll(tag .. "p " .. num(1.0 / 2.8) .. ": ", r, list, db.artFlip)
+        if D == "reticle" then checkTicks(tag .. "p " .. num(1.0 / 2.8) .. ": ", r, info, START[D][mode][1]) end
+        T.now = base + 2.81 T.update() T.now = base + 2.9 T.update() -- holding: the fill drawn full
+        local cx, cy = r.w / 2, (D == "arc" and r.h * NS.ARC_CY or r.h / 2)
+        local key, want = START[D][mode][1], START[D][mode][2]
+        local c = T.quadCorners(T.part(r, key .. "1"))
+        local a = type(c) == "table" and math.atan(c[1][2] - cy, c[1][1] - cx)
+        local off = a and math.abs(math.atan(math.sin(a - want), math.cos(a - want)))
+        check(off and off < 1e-6, tag .. key .. " starts where its path does (" .. num(a and math.deg(a)) .. " degrees, want " .. num(math.deg(want))
+          .. "; its outer corner " .. num(type(c) == "table" and dist(c[1][1], c[1][2], cx, cy)) .. " from the center)")
+        -- Not turned inside out: the inner corner on the same side of the center as the outer one.
+        local ai = type(c) == "table" and math.atan(c[2][2] - cy, c[2][1] - cx)
+        local offI = ai and math.abs(math.atan(math.sin(ai - want), math.cos(ai - want)))
+        check(offI and offI < 1e-6, tag .. key .. ": its inner corner on the same ray as the outer one, not mirrored through the center (" .. num(ai and math.deg(ai)) .. " degrees)")
+        -- Every strip a band round the center: its inner edge off the center, its outer edge further
+        -- out, and no wider than 0.8 of its radius (so it stays a ring).
+        local collapsed, wide = {}, {}
+        for name, t in pairs(r.tex) do
+          local k = name:sub(#D + 2)
+          if name:sub(1, #D + 2) == D .. ":Q" and T.isShown(t) and k:find("1$") and not k:find("%d%d$") then
+            local q = T.quadCorners(t)
+            local ro, ri = dist(q[1][1], q[1][2], cx, cy), dist(q[2][1], q[2][2], cx, cy)
+            if not (ri > 1e-6 and ro > ri) then collapsed[#collapsed + 1] = k:sub(1, -2) .. " (" .. num(ri) .. " to " .. num(ro) .. ")" end
+            if not (ro - ri <= 0.8 * (ro + ri) / 2 + 1e-9) then wide[#wide + 1] = k:sub(1, -2) .. " (" .. num(ro - ri) .. " wide at " .. num((ro + ri) / 2) .. ")" end
+          end
+        end
+        table.sort(collapsed) table.sort(wide)
+        check(#collapsed == 0, tag .. "every strip a band round the center, not a disk (not: " .. table.concat(collapsed, ", ") .. ")")
+        check(#wide == 0, tag .. "every strip no wider than 0.8 of its radius (not: " .. table.concat(wide, ", ") .. ")")
+        if D ~= "reticle" then
+          -- The line thickness capped to the size: the fill drawn at it, and line 30 on size 60 well under 30.
+          local g = roundGeom(D, mode, r.w, r.h, db.dispThick)
+          local drawn = type(c) == "table" and (dist(c[1][1], c[1][2], cx, cy) - dist(c[2][1], c[2][2], cx, cy)) or nil
+          check(close(drawn, g.th, 1e-6) and g.th <= ext[2] + 1e-12, tag .. key .. " drawn " .. num(g.th) .. " thick, the line capped to the size (" .. num(drawn) .. ")")
+          if ext[1] == 60 and ext[2] == 30 then
+            check(g.th < 20 and g.rad - g.widest / 2 > 1, tag .. "line 30 on size 60: capped to " .. num(g.th) .. ", the widest band (" .. num(g.widest)
+              .. ") leaves an inner radius of " .. num(g.rad - g.widest / 2))
+          end
+          local x1, y1, x2, y2 = T.segEnds(T.part(r, "shot"))
+          check(type(y1) == "number" and y1 > cy and y2 > cy, tag .. "the shot mark above the center (y " .. num(y1) .. " to " .. num(y2) .. ", center " .. num(cy) .. ")")
+          local d1, d2 = dist(x1, y1, cx, cy), dist(x2, y2, cx, cy)
+          check(close(x1, cx, 1e-9) and close(x2, cx, 1e-9) and close(d1, g.mark0, 1e-6) and close(d2, g.mark1, 1e-6) and d1 >= 1 - 1e-9,
+            tag .. "the shot mark straight up from a positive radius, " .. num(g.mark0) .. " to " .. num(g.mark1) .. " (" .. num(d1) .. " to " .. num(d2) .. ")")
+        end
+      end
+    end
+  end
+  check(#T.errors == 0, "no errors")
+`);
+
+// The same extremes on the Line strips (no vertex offsets): the thickness cap holds there too.
+scenario('Line strips at the slider extremes: the arc and the ring cap their line to the size, stay rings and keep the shot mark straight up from a positive radius, art and flat', DISPLAY_HELPERS + ART_HELPERS + LINE_STRIPS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  local base = 100
+  local FLATKEYS = { arc = { { "tl", 22, 1 }, { "tr", 22, 1 }, { "fl", 22 }, { "fr", 22 } }, ring = { { "t", 40, 1 }, { "f", 40 } } }
+  for _, mode in ipairs({ "art", "flat" }) do
+    if mode == "flat" then T.slash("style dark") end
+    for _, D in ipairs({ "arc", "ring" }) do
+      for _, ext in ipairs({ { 60, 2 }, { 60, 30 }, { 400, 2 }, { 400, 30 }, { 140, 12 } }) do
+        db.dispSize, db.dispThick = ext[1], ext[2]
+        T.slash("display " .. D)
+        local r = T.rend()
+        local tag = "[" .. D .. ", " .. mode .. ", size " .. ext[1] .. ", line " .. ext[2] .. "] "
+        base = base + 10
+        T.now = base T.fire("PLAYER_SWING", 2.8, 2)
+        T.now = base + 1.0 T.update()
+        local p = 1.0 / 2.8
+        check(r.quads == false and r.mode == mode, tag .. "Line strips, drawn " .. mode .. " (" .. tostring(r.quads) .. ", " .. tostring(r.mode) .. ")")
+        local g = roundGeom(D, mode, r.w, r.h, db.dispThick)
+        if mode == "art" then
+          local ag = artGeom(D, r.w, r.h, db.dispThick, p)
+          for _, key in ipairs({ "Abg", "Aframe" }) do
+            local _, lo, hi = checkStrip(tag, r, key, ag[key], 0, 1, { slice = key == "Abg" and "bg" or "frame", alpha = 1 })
+            check(close(lo, 0, 1e-6) and close(hi, 1, 1e-6), tag .. key .. ": full length (" .. num(lo) .. " to " .. num(hi) .. ")")
+          end
+          for _, key in ipairs(D == "arc" and { "Afl", "Afr" } or { "Afill" }) do
+            local _, lo, hi = checkStrip(tag, r, key, ag[key], 0, p, { slice = "fill", alpha = 0.95 })
+            check(close(lo, 0, 1e-6) and close(hi, p, 1e-6), tag .. key .. ": 0 to p (" .. num(lo) .. " to " .. num(hi) .. ")")
+          end
+        else
+          -- Flat: every Line's ends on the circle, at the capped thickness; the track all the way, the fill to p.
+          local bad = {}
+          for _, ks in ipairs(FLATKEYS[D]) do
+            local shown = 0
+            for i = 1, ks[2] do
+              local line = T.part(r, ks[1] .. i)
+              if T.isShown(line) then
+                shown = shown + 1
+                local x1, y1, x2, y2 = T.segEnds(line)
+                local d1, d2 = dist(x1, y1, g.cx, g.cy), dist(x2, y2, g.cx, g.cy)
+                if not (close(d1, g.rad, 1e-6) and close(d2, g.rad, 1e-6) and close(rawget(line, "thickness"), g.th, 1e-6)) then
+                  bad[#bad + 1] = ks[1] .. i .. " at " .. num(d1) .. "/" .. num(d2) .. ", " .. num(rawget(line, "thickness")) .. " thick"
+                end
+              end
+            end
+            local want = ks[3] and ks[2] or math.ceil(p * ks[2] - 1e-9)
+            if shown ~= want then bad[#bad + 1] = ks[1] .. ": " .. shown .. " shown, want " .. want end
+          end
+          check(#bad == 0, tag .. "every flat Line on radius " .. num(g.rad) .. ", " .. num(g.th) .. " thick (not: " .. table.concat(bad, ", ") .. ")")
+        end
+        -- Every Line of the curve no thicker than 0.8 of its radius: an inner edge off the center.
+        local wide, nLines = {}, 0
+        for name, s in pairs(r.segs) do
+          local k = name:sub(#D + 2)
+          local line = s.line
+          if name:sub(1, #D + 1) == D .. ":" and k ~= "shot" and T.isShown(line) then
+            nLines = nLines + 1
+            local x1, y1 = T.segEnds(line)
+            local d, th = dist(x1, y1, g.cx, g.cy), rawget(line, "thickness") or 0
+            if not (th <= 0.8 * d + 1e-9 and d - th / 2 > 0) then wide[#wide + 1] = k .. " (" .. num(th) .. " thick at " .. num(d) .. ")" end
+          end
+        end
+        table.sort(wide)
+        check(nLines > 0 and #wide == 0, tag .. nLines .. " Lines, each no thicker than 0.8 of its radius (not: " .. table.concat(wide, ", ") .. ")")
+        if ext[1] == 60 and ext[2] == 30 then
+          check(g.th < 20 and g.rad - g.widest / 2 > 1, tag .. "line 30 on size 60: capped to " .. num(g.th) .. ", inner radius " .. num(g.rad - g.widest / 2))
+        end
+        local x1, y1, x2, y2 = T.segEnds(T.part(r, "shot"))
+        local d1, d2 = dist(x1, y1, g.cx, g.cy), dist(x2, y2, g.cx, g.cy)
+        check(close(x1, g.cx, 1e-9) and close(x2, g.cx, 1e-9) and y1 > g.cy and close(d1, g.mark0, 1e-6) and close(d2, g.mark1, 1e-6) and d1 >= 1 - 1e-9,
+          tag .. "the shot mark straight up from a positive radius, " .. num(g.mark0) .. " to " .. num(g.mark1) .. " (" .. num(d1) .. " to " .. num(d2) .. ")")
+      end
+    end
+  end
   check(#T.errors == 0, "no errors")
 `);
 
