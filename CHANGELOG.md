@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 - 2026-10-17
+
+- The screen edge alert can have a color of its own: untick "Same color as the zone" on the Alerts tab and pick an edge color. It still turns the clip color while you move in the zone, with the move warning on.
+
 ## 0.3.0 - 2026-10-14
 
 - Displays: eleven designs of Shot Window's own, besides the marks on the game's bar. Classic bar, pincer bar, vertical pincer, closing gap, closing brackets, pips, scanner (the shot line stays in the middle and a spark sweeps across, stopping on it while a shot is late), rhythm track, horseshoe arc, ring with a countdown, and a tightening reticle. Every one shows the same things as the game's bar: move and stand still, brightening inside the zone, the hold and pulse while a shot is late, clipping, and the shot itself. The horseshoe's words (Move, Stand still, Moving, Late), the ring's Late and the ring's countdown can be turned off.

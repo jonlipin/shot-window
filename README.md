@@ -37,7 +37,7 @@ On the Alerts tab, all optional except the first two, and all work with or witho
 
 - **Warn when you move inside the zone** (the clip color), and **how late a late shot was**.
 - **Call-out text:** "Stop" inside the zone, "Moving" while you clip it, "Late" while a shot is overdue, "Go" just after the shot.
-- **Screen edge:** the edges of the screen tint while you must stand still, so you see it from the corner of your eye.
+- **Screen edge:** the edges of the screen tint while you must stand still, so you see it from the corner of your eye. In the zone's color or one of its own, and the clip color while you move in the zone (with the move warning on).
 - **Sound:** a short sound as the stand-still zone starts, once per swing.
 
 ## Options

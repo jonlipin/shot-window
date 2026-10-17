@@ -2021,7 +2021,7 @@ scenario('/shotwindow debug, garbage and empty input', String.raw`
   T.login(200)
   T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
   T.slash("debug")
-  check(T.said("version 0.3.0"), "debug: version")
+  check(T.said("version 0.3.1"), "debug: version")
   check(T.said("bar found: true, showSwingTimer: 1"), "debug: bar and cvar")
   check(T.said("swing: 2.8 s (weapon 2.8 s)"), "debug: swing line")
   check(T.said("red zone: last 0.50 s = window 0.50 s + latency 0 ms + extra 0 ms"), "debug: red zone line")
@@ -4897,6 +4897,284 @@ scenario('options: Defaults puts every display and alert setting back and hides 
   check(not ShotWindowCallout:IsShown() and not ShotWindowEdge:IsShown(), "call-out and edge gone")
   T.click(T.tab(2))
   check(buttonStarting("Design: ").text == "Design: None (marks on the game's bar only)", "the Design button says None")
+  check(#T.errors == 0, "no errors")
+`);
+
+// The screen edge's own color (0.3.1): "Same color as the zone" (edgeZoneColor, on by default) keeps
+// the edge in the zone color as before; unticked, it shows in "Edge color" (edgeColor, red by
+// default). Moving in the zone still turns it the clip color.
+const EDGE_HELPERS = String.raw`
+  local RED_C, AMBER, BLUE, GREEN = { 0.95, 0.2, 0.15 }, { 1, 0.6, 0.1 }, { 0.2, 0.3, 0.9 }, { 0.1, 0.8, 0.2 }
+  local EC, SAME, ON = "Edge color", "Same color as the zone", "Tint the screen's edges to stand still"
+  -- A band's color: its gradient's strong end (alpha 0.9), nil without one.
+  local function bandRGB(band)
+    local g = band and rawget(band, "gradient")
+    if not g then return nil end
+    local strong = (close(g[2].a, 0.9) and g[2]) or (close(g[3].a, 0.9) and g[3]) or nil
+    return strong and { strong.r, strong.g, strong.b }
+  end
+  -- The four bands' color when all four share one, else nil.
+  local function edgeRGB(bands)
+    local c
+    for i = 1, 4 do
+      local b = bandRGB(bands[i])
+      if not b or (c and not sameRGB(b, c)) then return nil end
+      c = c or b
+    end
+    return c
+  end
+  -- The live edge (ShotWindowEdge) shown in want at alpha.
+  local function liveIs(label, want, alpha)
+    local e = rawget(_G, "ShotWindowEdge")
+    local c = e and edgeRGB(e.textures)
+    check(e and e:IsShown() and sameRGB(c, want) and close(rawget(e, "alpha"), alpha, 1e-6),
+      label .. " (" .. rgbStr(c) .. ", alpha " .. num(e and rawget(e, "alpha")) .. ", want " .. rgbStr(want) .. " at " .. num(alpha) .. ")")
+  end
+  local function pick(label, c) T.click(T.swatch(label)) T.pickColor(c[1], c[2], c[3]) end
+  -- Opens a tab unless it is the open one (its button disabled then).
+  local function openTab(i) local t = T.tab(i) if t:IsEnabled() then T.click(t) end end
+`;
+
+scenario('edge color, defaults: Same color as the zone on, the edge color red; the live edge in the zone color while lit and late (pulsing), on the next frame after the zone swatch changes it; the clip color while moving', DISPLAY_HELPERS + EDGE_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { edge = true }
+  T.login(200)
+  local db = ShotWindowDB
+  check(db.edgeZoneColor == true and sameRGB(db.edgeColor, RED_C),
+    "defaults: edgeZoneColor on, edgeColor red (" .. tostring(db.edgeZoneColor) .. ", " .. rgbStr(db.edgeColor) .. ")")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.4 T.update()
+  liveIs("lit: the zone color at 0.6", db.color, 0.6)
+  T.slash("")
+  openTab(1)
+  pick("Zone color", BLUE)
+  T.update()
+  liveIs("the zone color picked (live): the edge follows on the next frame", BLUE, 0.6)
+  T.pickerCancel()
+  T.update()
+  liveIs("Cancel: back to the old zone color on the next frame", RED_C, 0.6)
+  pick("Zone color", BLUE) T.pickerOkay()
+  T.update()
+  liveIs("Okay: the edge in the picked zone color", BLUE, 0.6)
+  check(sameRGB(db.edgeColor, RED_C) and db.edgeColor ~= db.color, "the edge color itself untouched, its own table (" .. rgbStr(db.edgeColor) .. ")")
+  T.now = 102.5 T.fire("PLAYER_STARTED_MOVING") T.update()
+  liveIs("moving in the zone: the clip color at 0.85", AMBER, 0.85)
+  T.now = 102.81 T.update()
+  T.now = 103.0 T.update()
+  T.now = 103.1 T.fire("PLAYER_STOPPED_MOVING")
+  T.now = 103.25 T.update()
+  liveIs("standing, the shot late: the zone color, pulsing", BLUE, 0.7 * pulseAt(103.25 - 102.81))
+  T.now = 103.45 T.update()
+  liveIs("later in the wait: the zone color, the pulse moved on", BLUE, 0.7 * pulseAt(103.45 - 102.81))
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks (" .. table.concat(T.unknownBut(), ", ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('edge color, own: Edge color and Same color as the zone on the Alerts tab under Edge width, above Sound, gray out with the edge and the box; unticked, the live edge in the edge color (lit 0.6, late pulsing 0.7), the clip color while moving; its swatch repaints on the next frame; the zone color no longer moves it; ticked again, the zone color', DISPLAY_HELPERS + EDGE_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  T.login(200)
+  local db = ShotWindowDB
+  T.slash("")
+  openTab(3)
+  local page = T.pages()[3]
+  local sw, cb, slider = T.swatch(EC), T.checkbox(SAME), T.slider("Edge width")
+  local holder = slider and slider.parent
+  local sound
+  for _, fs in ipairs(page.fontStrings) do if rawget(fs, "text") == "Sound" then sound = fs end end
+  check(sw and cb and holder and sound and sw.parent == page and cb.parent == page and holder.parent == page,
+    "Edge color, the box, Edge width and the Sound header on the Alerts page")
+  local function at(f)
+    local p = f and f.points[1]
+    if p and p[1] == "TOPLEFT" and type(p[2]) == "number" and type(p[3]) == "number" then return p[2], -p[3] end
+  end
+  local hx, hy = at(holder)
+  local sx, sy = at(sw)
+  local cx, cy = at(cb)
+  local nx, ny = at(sound)
+  local where = string.format("width %s,%s; color %s,%s; box %s,%s; Sound %s,%s", tostring(hx), tostring(hy), tostring(sx), tostring(sy),
+    tostring(cx), tostring(cy), tostring(nx), tostring(ny))
+  check(hx and sx and cx and nx and hx == 308 and sx == 308 and cx == 304 and nx == 308, "all four in the right column (" .. where .. ")")
+  check(hy and sy and cy and ny and hy < sy and sy + sw.height <= cy and cy + cb.height <= ny,
+    "top to bottom: Edge width, Edge color, the box, the Sound header (" .. where .. ")")
+  check(cy and sy and ny and cy - sy == 24 and ny - cy == 36, "the box 28 under the swatch's row, the Sound header 8 more than a row under the box (" .. where .. ")")
+  local labelW = 0
+  for _, fs in ipairs(cb.fontStrings) do if rawget(fs, "text") == SAME then labelW = fs:GetStringWidth() end end
+  check(cx and cy and labelW > 0 and cx + cb.width + 2 + labelW <= 600 and cy + cb.height <= 384 and sy + sw.height <= 384,
+    "both inside the page (the box's label ends at " .. tostring(cx and cx + cb.width + 2 + labelW) .. ")")
+
+  -- Gray-out: both while the edge is off; the swatch while the box is ticked.
+  check(cb:GetChecked() == true and db.edge == false, "the box ticked, the edge off by default")
+  checkControls("edge off", { [EC] = "grayed", [SAME] = "grayed" })
+  T.click(T.checkbox(ON))
+  checkControls("edge on, box ticked", { [EC] = "grayed", [SAME] = "usable" })
+  T.click(cb)
+  check(db.edgeZoneColor == false and cb:GetChecked() == false and db.edge == true, "unticked: edgeZoneColor off, the edge still on")
+  checkControls("edge on, box unticked", { [EC] = "usable", [SAME] = "usable" })
+  T.click(T.checkbox(ON))
+  checkControls("edge off, box unticked", { [EC] = "grayed", [SAME] = "grayed" })
+  T.click(T.checkbox(ON))
+  checkControls("edge on again", { [EC] = "usable", [SAME] = "usable" })
+  check(sameRGB(T.swatchRGB(EC), RED_C), "the swatch shows the edge color, red (" .. rgbStr(T.swatchRGB(EC)) .. ")")
+
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.4 T.update()
+  liveIs("lit: the edge color at 0.6", RED_C, 0.6)
+  pick(EC, GREEN)
+  check(sameRGB(db.edgeColor, GREEN) and sameRGB(db.color, RED_C) and sameRGB(T.swatchRGB(EC), GREEN), "picked live: edgeColor and its swatch green, the zone color untouched")
+  T.update()
+  liveIs("picked live: the edge green on the next frame", GREEN, 0.6)
+  T.pickerCancel()
+  check(sameRGB(db.edgeColor, RED_C) and sameRGB(T.swatchRGB(EC), RED_C), "Cancel: edgeColor and its swatch red again")
+  T.update()
+  liveIs("Cancel: the edge red again on the next frame", RED_C, 0.6)
+  pick(EC, GREEN) T.pickerOkay()
+  T.update()
+  liveIs("Okay: the edge green", GREEN, 0.6)
+  openTab(1)
+  pick("Zone color", BLUE) T.pickerOkay()
+  T.update()
+  liveIs("the zone color changed: the edge stays green", GREEN, 0.6)
+  T.now = 102.5 T.fire("PLAYER_STARTED_MOVING") T.update()
+  liveIs("moving in the zone: still the clip color at 0.85", AMBER, 0.85)
+  T.now = 102.81 T.update()
+  T.now = 103.0 T.update()
+  liveIs("the bar ran out while moving: the clip color", AMBER, 0.85)
+  T.now = 103.1 T.fire("PLAYER_STOPPED_MOVING")
+  T.now = 103.25 T.update()
+  liveIs("standing, the shot late: the edge color, pulsing", GREEN, 0.7 * pulseAt(103.25 - 102.81))
+  T.now = 103.45 T.update()
+  liveIs("later in the wait: the edge color, the pulse moved on", GREEN, 0.7 * pulseAt(103.45 - 102.81))
+  openTab(3)
+  T.click(T.checkbox(SAME))
+  check(db.edgeZoneColor == true and sameRGB(db.edgeColor, GREEN), "ticked again: edgeZoneColor on, the edge color kept")
+  checkControls("ticked again", { [EC] = "grayed", [SAME] = "usable" })
+  T.update()
+  liveIs("ticked again: the zone color on the next frame, still pulsing", BLUE, 0.7 * pulseAt(103.45 - 102.81))
+  T.now = 103.5 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 105.9 T.update()
+  liveIs("the next zone: the zone color at 0.6", BLUE, 0.6)
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks (" .. table.concat(T.unknownBut(), ", ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('edge color, the options preview: its 12 px edge in the zone color by default, the edge color with the box unticked, the clip color while moving either way; a swatch change or the box shows on the next frame', DISPLAY_HELPERS + EDGE_HELPERS + String.raw`
+  ShotWindowDB = { edge = true }
+  T.login(200)
+  local db = ShotWindowDB
+  T.slash("")
+  local stage = T.preview()
+  check(stage and stage:IsVisible(), "the preview shows")
+  local bands = { stage.textures[1], stage.textures[2], stage.textures[3], stage.textures[4] }
+  -- This frame's color and alpha, nil while hidden.
+  local function frame()
+    for i = 1, 4 do if not rawget(bands[i], "shown") then return nil end end
+    return edgeRGB(bands), rawget(bands[1], "alpha")
+  end
+  local function frameIs(label, want, alpha)
+    local c, a = frame()
+    check(sameRGB(c, want) and close(a, alpha, 1e-6), label .. " (" .. rgbStr(c) .. ", alpha " .. num(a) .. ")")
+  end
+  -- Frames until the zone is lit in want (not late, not clipping).
+  local function toLit(want)
+    for k = 1, 200 do
+      T.now = T.now + 0.05 T.update()
+      local c, a = frame()
+      if c and sameRGB(c, want) and close(a, 0.6, 1e-6) then return true end
+    end
+    return false
+  end
+  -- Ten seconds of the loop: every shown frame in the clip color at 0.85 or in want, lit at 0.6 or pulsing.
+  local function loop(label, want)
+    local clip, lit, pulsing, other, alphas = 0, 0, 0, {}, {}
+    for k = 1, 100 do
+      T.now = T.now + 0.1 T.update()
+      local c, a = frame()
+      if c then
+        local thin = close(bands[1].height, 12, 1e-9) and close(bands[3].width, 12, 1e-9)
+        if thin and sameRGB(c, db.clipColor) and close(a, 0.85, 1e-6) then clip = clip + 1
+        elseif thin and sameRGB(c, want) and close(a, 0.6, 1e-6) then lit = lit + 1
+        elseif thin and sameRGB(c, want) and type(a) == "number" and a >= 0.7 * 0.2 - 1e-6 and a <= 0.7 + 1e-6 then
+          if not alphas[num(a)] then pulsing = pulsing + 1 end
+          alphas[num(a)] = true
+        else other[#other + 1] = rgbStr(c) .. " at " .. num(a) end
+      end
+    end
+    check(clip > 0 and lit > 0 and pulsing >= 2 and #other == 0, label .. ": " .. clip .. " clipping, " .. lit .. " lit, " .. pulsing
+      .. " pulse alphas (0.14 to 0.7), 12 px" .. (#other > 0 and ("; also " .. table.concat(other, ", ")) or ""))
+  end
+  loop("defaults: the zone color", db.color)
+  check(toLit(db.color), "lit in the zone color")
+  openTab(1)
+  pick("Zone color", BLUE)
+  T.update()
+  frameIs("the zone color picked: blue on the next frame", BLUE, 0.6)
+  T.pickerOkay()
+  loop("the picked zone color", BLUE)
+  openTab(3)
+  check(toLit(BLUE), "lit in blue")
+  T.click(T.checkbox(SAME))
+  T.update()
+  frameIs("unticked: the edge color (red) on the next frame", RED_C, 0.6)
+  pick(EC, GREEN)
+  T.update()
+  frameIs("the edge color picked: green on the next frame", GREEN, 0.6)
+  T.pickerCancel()
+  T.update()
+  frameIs("Cancel: red again on the next frame", RED_C, 0.6)
+  pick(EC, GREEN) T.pickerOkay()
+  loop("unticked: the edge color", GREEN)
+  openTab(1)
+  check(toLit(GREEN), "lit in green")
+  pick("Zone color", { 0.5, 0.1, 0.6 }) T.pickerOkay()
+  T.update()
+  frameIs("the zone color changed: still green", GREEN, 0.6)
+  openTab(3)
+  T.click(T.checkbox(SAME))
+  T.update()
+  frameIs("ticked again: the zone color on the next frame", { 0.5, 0.1, 0.6 }, 0.6)
+  loop("ticked again: the zone color", db.color)
+  check(#T.unknownBut() == 0, "no widget field read that the client lacks (" .. table.concat(T.unknownBut(), ", ") .. ")")
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('edge color, saved settings from before 0.3.1 (neither key): Same color as the zone on, the edge in the saved zone color', DISPLAY_HELPERS + EDGE_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { edge = true, color = { 0.2, 0.3, 0.9 } }
+  T.login(200)
+  local db = ShotWindowDB
+  check(db.edgeZoneColor == true and sameRGB(db.edgeColor, RED_C) and sameRGB(db.color, BLUE),
+    "loaded: edgeZoneColor on, edgeColor red, the zone color kept (" .. tostring(db.edgeZoneColor) .. ", " .. rgbStr(db.edgeColor) .. ")")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.4 T.update()
+  liveIs("lit: the saved zone color, as before 0.3.1", BLUE, 0.6)
+  T.slash("")
+  openTab(3)
+  check(T.checkbox(SAME):GetChecked() == true, "the box ticked")
+  checkControls("old settings", { [EC] = "grayed", [SAME] = "usable" })
+  check(#T.errors == 0, "no errors")
+`);
+
+scenario('edge color, a saved own color is kept; Defaults ticks the box again and puts the edge color back to red, a fresh table each time', DISPLAY_HELPERS + EDGE_HELPERS + String.raw`
+  T.autoRepMode, T.autoRep[75] = "plain", true
+  ShotWindowDB = { edge = true, edgeZoneColor = false, edgeColor = { 0.1, 0.8, 0.2 } }
+  T.login(200)
+  local db = ShotWindowDB
+  check(db.edgeZoneColor == false and sameRGB(db.edgeColor, GREEN), "loaded: the own color kept (" .. tostring(db.edgeZoneColor) .. ", " .. rgbStr(db.edgeColor) .. ")")
+  T.now = 100 T.fire("PLAYER_SWING", 2.8, 2)
+  T.now = 102.4 T.update()
+  liveIs("lit: the saved edge color", GREEN, 0.6)
+  T.slash("")
+  openTab(3)
+  check(T.checkbox(SAME):GetChecked() == false and sameRGB(T.swatchRGB(EC), GREEN), "the box unticked, the swatch green")
+  checkControls("own color", { [EC] = "usable", [SAME] = "usable" })
+  T.click(T.button("Defaults"))
+  check(db.edgeZoneColor == true and sameRGB(db.edgeColor, RED_C), "Defaults: edgeZoneColor on, edgeColor red (" .. tostring(db.edgeZoneColor) .. ", " .. rgbStr(db.edgeColor) .. ")")
+  check(T.checkbox(SAME):GetChecked() == true and sameRGB(T.swatchRGB(EC), RED_C), "Defaults: the box ticked, the swatch red")
+  checkControls("Defaults", { [EC] = "grayed", [SAME] = "grayed" })
+  db.edgeColor[1], db.edgeColor[2] = 0, 0
+  local first = db.edgeColor
+  T.click(T.button("Defaults"))
+  check(sameRGB(db.edgeColor, RED_C) and db.edgeColor ~= first, "Defaults again: red, a fresh table (the first one changed did not change the default)")
   check(#T.errors == 0, "no errors")
 `);
 

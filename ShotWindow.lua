@@ -15,7 +15,7 @@
 
 local ADDON, ns = ...
 
-ns.VERSION = "0.3.0"
+ns.VERSION = "0.3.1"
 
 local RANGED = Enum and Enum.PlayerSwingType and Enum.PlayerSwingType.Ranged or 2
 local RED = { 0.95, 0.20, 0.15 }
@@ -49,6 +49,8 @@ local DEFAULTS = {
 	calloutSize = 26,
 	edge = false,     -- tint the screen's edges while you must stand still
 	edgeSize = 90,
+	edgeZoneColor = true, -- the edge in the zone's color; off: in edgeColor
+	edgeColor = { RED[1], RED[2], RED[3] },
 	sound = false,    -- a sound as the stand-still zone starts
 	soundKit = 1,
 	-- Display of our own (Displays.lua)
@@ -915,7 +917,10 @@ local function BuildAlertsPage(p)
 	y = OptionSlider(p, "Edge width", RIGHT, y - 4, 20, 300, 10,
 		function() return db.edgeSize end, function(v) db.edgeSize = v end,
 		function(v) return v .. " px" end, Is("edge"))
-	y = Header(p, "Sound", RIGHT, y)
+	-- A color of its own, or the zone's; moving in the zone still turns it the clip color.
+	y = OptionColor(p, "Edge color", "edgeColor", RIGHT, y, function() return db.edge and not db.edgeZoneColor end)
+	y = OptionCheck(p, "Same color as the zone", "edgeZoneColor", RIGHT, y, Is("edge"))
+	y = Header(p, "Sound", RIGHT, y - 8)
 	y = OptionCheck(p, "Play a sound as the zone starts", "sound", RIGHT, y)
 	OptionCycle(p, RIGHT, y, 200, function()
 		local list = ns.SOUNDS or {}

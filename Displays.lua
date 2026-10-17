@@ -998,11 +998,13 @@ end
 -- How strongly the edge shows, and in which color: nil when it should not show.
 local function EdgeState(s, db)
 	if s.clipping then return db.clipColor, 0.85 end
+	-- The edge's own color, or the zone's (the default, as before 0.3.1).
+	local c = (db.edgeZoneColor == false and db.edgeColor) or db.color
 	if s.waiting and s.waitKind == "late" and (s.waitAge or 0) >= WAIT_GRACE then
 		local pulse = db.pulse and (0.6 + 0.4 * math.cos(((s.waitAge or 0) - WAIT_GRACE) * math.pi * 2.5)) or 1
-		return db.color, 0.7 * pulse
+		return c, 0.7 * pulse
 	end
-	if s.lit then return db.color, 0.6 end
+	if s.lit then return c, 0.6 end
 	return nil
 end
 ns.EdgeState = EdgeState
